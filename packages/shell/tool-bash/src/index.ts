@@ -52,7 +52,7 @@ interface BashToolArgs {
   justification?: string
 }
 
-function validateBashArgs(args: BashToolArgs): void {
+function validateBashArgs(args: BashToolArgs, sameModeRequest = false): void {
   if (args.command.trim().length === 0) {
     throw new Error('invalid command: expected a non-empty string')
   }
@@ -63,8 +63,12 @@ function validateBashArgs(args: BashToolArgs): void {
     throw new Error(`invalid timeoutMs: expected a positive number, got ${JSON.stringify(args.timeoutMs)}`)
   }
   // The escalation pairing (sandbox_permissions ⇔ justification, non-empty) is
-  // the shared rule both enforcing families validate identically.
-  validateEscalationArgs(args.sandbox_permissions, args.justification)
+  // the shared rule both enforcing families validate identically — except a
+  // same-mode request, a no-op that grants nothing, which skips the pairing
+  // check and the approval ask (models habitually re-declare the current mode).
+  if (!sameModeRequest) {
+    validateEscalationArgs(args.sandbox_permissions, args.justification)
+  }
 }
 
 function bashDescription(backgroundEnabled: boolean, escalationModes: readonly SandboxMode[]): string {
@@ -328,12 +332,20 @@ export function apply(ctx: Context, config: Config = {}): void {
       }],
     },
     async execute(args: BashToolArgs, exec) {
-      validateBashArgs(args)
-      // Description is display metadata; workdir defaults to the caller's session.
+      // Resolve the standing policy before validation so a same-mode
+      // sandbox_permissions request (a no-op grant) can skip the escalation
+      // pairing and approval path entirely. Description is display metadata;
+      // workdir defaults to the caller's session.
       const standingPolicy = resolveSandboxPolicy(exec)
-      const approvedMode = args.sandbox_permissions !== undefined && args.justification !== undefined
-        ? await approveBashEscalation(args.sandbox_permissions, args.justification, exec, standingPolicy)
-        : undefined
+      const sameModeRequest = args.sandbox_permissions !== undefined
+        && standingPolicy !== undefined
+        && args.sandbox_permissions === standingPolicy.mode
+      validateBashArgs(args, sameModeRequest)
+      const approvedMode = sameModeRequest
+        ? args.sandbox_permissions as SandboxMode
+        : args.sandbox_permissions !== undefined && args.justification !== undefined
+          ? await approveBashEscalation(args.sandbox_permissions, args.justification, exec, standingPolicy)
+          : undefined
       const policy = approvedMode === undefined
         ? standingPolicy
         : { ...(standingPolicy as SandboxExecutionPolicy), mode: approvedMode }

@@ -1678,8 +1678,9 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
     const attached = new Set(items.map(item => item.sessionId))
     const persistence = ctx.get('sessionPersistence')
     if (persistence !== undefined) {
+      const archivedIds = new Set(ctx.workspaceRegistry.archivedSessionIds)
       const cold = (await persistence.list(signal))
-        .filter(meta => !attached.has(meta.id) && meta.cwd !== undefined)
+        .filter(meta => !attached.has(meta.id) && meta.cwd !== undefined && !archivedIds.has(meta.id))
       signal?.throwIfAborted()
       for (let offset = 0; offset < cold.length; offset += COLD_SUMMARY_BATCH_SIZE) {
         signal?.throwIfAborted()

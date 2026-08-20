@@ -132,6 +132,40 @@ const CAPACITY_HINT: Readonly<Record<CapacityField, string>> = {
   maxTokens: '32K',
 }
 
+/** Canonical reasoning levels accepted by the pi-ai adapter. */
+const REASONING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+
+type ReasoningLevel = typeof REASONING_LEVELS[number]
+
+/** Display a model's wire-level reasoning map as a compact editable string. */
+function reasoningSpelling(model: ModelDraft): string {
+  const value = model.reasoningEfforts
+  if (value === false || typeof value !== 'object' || value === null) return value === false ? 'off' : ''
+  const efforts = value as Record<ReasoningLevel, string | null>
+  return REASONING_LEVELS.filter(level => Object.prototype.hasOwnProperty.call(efforts, level))
+    .map(level => `${level}${efforts[level] === null ? '' : `=${String(efforts[level])}`}`)
+    .join(', ')
+}
+
+/** Parse `off,low,high=high` into the profile's reasoningEfforts map. */
+function parseReasoning(text: string): false | Record<ReasoningLevel, string | null> | undefined {
+  const trimmed = text.trim()
+  if (trimmed.length === 0) return undefined
+  if (trimmed.toLowerCase() === 'off') return false
+  const result: Partial<Record<ReasoningLevel, string | null>> = {}
+  for (const raw of trimmed.split(',')) {
+    const [rawLevel, ...wireParts] = raw.trim().split('=')
+    const level = rawLevel?.trim().toLowerCase() as ReasoningLevel
+    if (!REASONING_LEVELS.includes(level)) continue
+    const wire = wireParts.join('=').trim()
+    // Bare thinking levels use the canonical wire spelling. Only `off` may
+    // intentionally omit a wire value; this makes the common `low,high`
+    // shorthand valid while still allowing gateways to use `high=ultra`.
+    result[level] = wire.length === 0 ? (level === 'off' ? null : level) : wire
+  }
+  return Object.keys(result).length === 0 ? undefined : result as Record<ReasoningLevel, string | null>
+}
+
 /**
  * Spell a stored count for a field that may be unset. The spelling itself is
  * {@link formatCapacity}, shared with the DeepSeek catalog editor so both
@@ -174,9 +208,20 @@ export function ModelListEditor(props: ModelListEditorProps): ReactNode {
   // FIELD: a single buffer would be displaced by editing any other field, and
   // the abandoned one would render its stored NaN as the literal `NaN`.
   const [editing, setEditing] = useState<ReadonlyMap<string, string>>(new Map())
+  // Reasoning is a comma-separated free-form field. Keep the raw text while
+  // typing; parsing every keystroke would erase intermediate input such as `h`.
+  const [reasoningEditing, setReasoningEditing] = useState<ReadonlyMap<number, string>>(new Map())
 
   /** Buffer key for one capacity field; the row half moves when rows do. */
   const bufferKey = (index: number, field: CapacityField): string => `${String(index)}:${field}`
+
+  const reasoningText = (model: ModelDraft, index: number): string =>
+    reasoningEditing.get(index) ?? reasoningSpelling(model)
+
+  const editReasoning = (index: number, text: string): void => {
+    setReasoningEditing(current => new Map(current).set(index, text))
+    patch(index, { reasoningEfforts: parseReasoning(text) })
+  }
 
   const editCapacity = (index: number, field: CapacityField, text: string): void => {
     setEditing(current => new Map(current).set(bufferKey(index, field), text))
@@ -210,7 +255,7 @@ export function ModelListEditor(props: ModelListEditorProps): ReactNode {
     })
   }
 
-  const patch = (index: number, next: Record<string, string | number | undefined>): void => {
+  const patch = (index: number, next: Record<string, unknown>): void => {
     onChange(models.map((model, at) => {
       if (at !== index) return model
       // Rebuilt rather than spread over: an emptied optional field has to leave
@@ -429,6 +474,19 @@ export function ModelListEditor(props: ModelListEditorProps): ReactNode {
                     onChange={(event) => { editCapacity(index, 'maxTokens', event.target.value) }}
                   />
                 </label>
+                <label className={styles['modelField']}>
+                  <span className={styles['modelFieldLabel']}>{t('modelReasoningEfforts')}</span>
+                  <input
+                    className={styles['input']}
+                    type="text"
+                    value={reasoningText(model, index)}
+                    placeholder={t('modelReasoningEffortsPlaceholder')}
+                    aria-label={`${t('modelReasoningEfforts')} ${index + 1}`}
+                    disabled={disabled}
+                    onChange={(event) => { editReasoning(index, event.target.value) }}
+                  />
+                </label>
+                <p className={styles['modelFieldHint']}>{t('modelReasoningEffortsHint')}</p>
               </div>
             )
             : null}

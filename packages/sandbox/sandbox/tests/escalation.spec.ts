@@ -81,11 +81,30 @@ describe('approveEscalation', () => {
     expect(seen[0]?.reason).toBe('escalate sandbox to workspace-write: the user asked to write in the workspace')
   })
 
+  it('a same-mode request is granted without asking — no approver, approval channel, or pairing gate is consulted', async () => {
+    const seen: unknown[] = []
+    for (const [requestedMode, effectiveMode] of [
+      ['read-only', 'read-only'],
+      ['workspace-write', 'workspace-write'],
+      ['danger-full-access', 'danger-full-access'],
+    ] as const) {
+      const spy = ingredients({ approver: approver('allowed-once', r => seen.push(r)) })
+      await expect(approveEscalation(req({ requestedMode, effectiveMode: effectiveMode as never }), spy))
+        .resolves.toBe(effectiveMode)
+    }
+    expect(seen).toEqual([])
+    // The grant needs no channel: a same-mode request raises nothing.
+    await expect(approveEscalation(
+      req({ requestedMode: 'danger-full-access', effectiveMode: 'danger-full-access' as never }),
+      ingredients({ approver: undefined, agent: undefined }),
+    )).resolves.toBe('danger-full-access')
+  })
+
   it('a non-widening request fails closed with its own text and never asks', async () => {
     const seen: unknown[] = []
     const spy = ingredients({ approver: approver('allowed-once', r => seen.push(r)) })
-    await expect(approveEscalation(req({ requestedMode: 'read-only' }), spy))
-      .rejects.toThrow(/not strictly wider than this call's current "read-only" mode/)
+    await expect(approveEscalation(req({ requestedMode: 'read-only', effectiveMode: 'workspace-write' }), spy))
+      .rejects.toThrow(/not strictly wider than this call's current "workspace-write" mode/)
     await expect(approveEscalation(req({ requestedMode: 'workspace-write', effectiveMode: 'danger-full-access' as never }), spy))
       .rejects.toThrow(/not strictly wider/)
     expect(seen).toEqual([])

@@ -48,6 +48,18 @@ export const ENV_OVERRIDES = {
 export const ENCODING_PREAMBLE =
   '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
 
+/**
+ * Windows PowerShell may prefer npm.ps1/pnpm.ps1 over the executable .cmd
+ * shims. Those generated scripts are not reliable inside DSH's strict-mode
+ * sandbox, so route package-manager functions directly to their .cmd shims.
+ * The prefix is empty elsewhere and remains safe to prepend to any command.
+ */
+export const WINDOWS_PACKAGE_MANAGER_PREAMBLE = process.platform === 'win32'
+  ? 'function npm { $npmCommand = Get-Command npm.cmd -CommandType Application | Select-Object -First 1; if ($null -eq $npmCommand) { throw "npm.cmd not found on PATH" }; $npmRoot = Split-Path -Parent $npmCommand.Source; & (Join-Path $npmRoot "node.exe") (Join-Path $npmRoot "node_modules\\npm\\bin\\npm-cli.js") @args }; function npx { & npx.cmd @args }; function pnpm { & pnpm.cmd @args }; function yarn { & yarn.cmd @args }; '
+  : ''
+
+export const POWERSHELL_COMMAND_PREAMBLE = ENCODING_PREAMBLE + WINDOWS_PACKAGE_MANAGER_PREAMBLE
+
 /** Default SIGTERM→SIGKILL grace period (the `graceMs` config). */
 const DEFAULT_GRACE_MS = 3_000
 
@@ -215,7 +227,7 @@ export class PwshLocalExecutor extends ShellExecutor {
    * `@deepseek-ai/dsh-pwsh-sandbox`).
    */
   protected argv(spec: ShellExecSpec): string[] {
-    return [this.pwshPath, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', `${ENCODING_PREAMBLE}${spec.command}`]
+    return [this.pwshPath, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', `${POWERSHELL_COMMAND_PREAMBLE}${spec.command}`]
   }
 
   /** Map one resolved spec plus its argv onto a fully-specified subprocess spawn. */

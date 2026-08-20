@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { PwshLocalExecutor, ENCODING_PREAMBLE, candidatePwshPaths, resolvePwshPath } from '@deepseek-ai/dsh-pwsh-local'
+import { PwshLocalExecutor, ENCODING_PREAMBLE, POWERSHELL_COMMAND_PREAMBLE, WINDOWS_PACKAGE_MANAGER_PREAMBLE, candidatePwshPaths, resolvePwshPath } from '@deepseek-ai/dsh-pwsh-local'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import SubprocessRuntime from '@deepseek-ai/dsh-subprocess'
 import type { SubprocessHandle, SubprocessOutputReader, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
@@ -175,7 +175,7 @@ describe('spawn construction (pure, every platform)', () => {
     }
   }
 
-  it('runs every command as ONE argv element under the UTF-8 encoding preamble', async () => {
+  it('runs every command as ONE argv element under the encoding and Windows shim preambles', async () => {
     const ctx = new Context()
     const subprocess = new CapturingSubprocessRuntime(ctx)
     await ctx.plugin(PwshLocalExecutor)
@@ -183,9 +183,14 @@ describe('spawn construction (pure, every platform)', () => {
     expect(subprocess.specs).toHaveLength(1)
     const { argv } = subprocess.specs[0]!
     expect(argv.slice(0, 5)).toEqual([expect.any(String), '-NoLogo', '-NoProfile', '-NonInteractive', '-Command'])
-    expect(argv[5]).toBe(`${ENCODING_PREAMBLE}Write-Output 你好`)
+    expect(argv[5]).toBe(`${POWERSHELL_COMMAND_PREAMBLE}Write-Output 你好`)
+    expect(POWERSHELL_COMMAND_PREAMBLE).toContain(ENCODING_PREAMBLE)
     expect(ENCODING_PREAMBLE).toContain('[Console]::OutputEncoding')
     expect(ENCODING_PREAMBLE).toContain('$OutputEncoding')
+    if (process.platform === 'win32') {
+      expect(POWERSHELL_COMMAND_PREAMBLE).toContain(WINDOWS_PACKAGE_MANAGER_PREAMBLE)
+      expect(POWERSHELL_COMMAND_PREAMBLE).toContain('function npm { & npm.cmd @args }')
+    }
   })
 })
 

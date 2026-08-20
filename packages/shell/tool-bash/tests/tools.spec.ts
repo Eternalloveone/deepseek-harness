@@ -608,7 +608,10 @@ describe('sandbox escalation through the generic task producer', () => {
     const { ctx } = await setupSandboxed(true)
     const prompted = vi.fn()
     ctx.on('approval/request', () => { prompted(); return Promise.resolve<ApprovalOutcome>('allowed-once') })
-    const result = await call(ctx, 'bash', { ...escalate, sandbox_permissions: 'workspace-write' }, sandboxAgent('workspace-write'))
+    // A request for a mode NARROWER than the effective one is still rejected
+    // (workspace-write ⇒ danger-full-access session); a same-mode request is a
+    // no-op grant and is covered by its own case below.
+    const result = await call(ctx, 'bash', { ...escalate, sandbox_permissions: 'workspace-write' }, sandboxAgent('danger-full-access'))
     expect(text(result)).toContain('not strictly wider')
     expect(prompted).not.toHaveBeenCalled()
 
@@ -618,6 +621,20 @@ describe('sandbox escalation through the generic task producer', () => {
       data: { mode: 'unknown-mode' },
     })
     expect(text(await call(ctx, 'bash', escalate, malformed))).toContain('not strictly wider')
+  })
+
+  it('grants a same-mode sandbox_permissions request without prompting (a no-op, even without a justification)', async () => {
+    const { ctx, bash } = await setupSandboxed(true)
+    const prompted = vi.fn()
+    ctx.on('approval/request', () => { prompted(); return Promise.resolve<ApprovalOutcome>('allowed-once') })
+    // Same mode with a justification: passes through, no approval ask.
+    const withReason = await call(ctx, 'bash', escalate, sandboxAgent('workspace-write'))
+    expect(withReason.isError).toBe(false)
+    // Same mode without a justification: pairing validation is skipped too.
+    const bare = await call(ctx, 'bash', { command: 'true', description: 'bare same-mode declaration', sandbox_permissions: 'workspace-write' }, sandboxAgent('workspace-write'))
+    expect(bare.isError).toBe(false)
+    expect(prompted).not.toHaveBeenCalled()
+    expect(bash.modes).toEqual(['workspace-write', 'workspace-write'])
   })
 
   it('fails closed when approval cannot be routed', async () => {

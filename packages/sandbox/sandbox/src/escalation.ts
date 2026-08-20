@@ -141,7 +141,9 @@ export interface EscalationRequest {
 }
 
 /**
- * Resolve a sandbox-escalation request BEFORE anything executes: check strict
+ * Resolve a sandbox-escalation request BEFORE anything executes: grant a
+ * same-mode request (it asks for exactly the mode the call already runs
+ * under, so it gains nothing) without prompting, otherwise check strict
  * widening against the call's effective mode, then resolve the approval
  * channel, then map every outcome — the ordered fail-closed sequence both
  * enforcing families share. Returns the granted mode to stamp onto exactly
@@ -156,6 +158,11 @@ export interface EscalationRequest {
  */
 export async function approveEscalation<A, C>(request: EscalationRequest, approval: EscalationApproval<A, C>): Promise<SandboxMode> {
   const { requestedMode: mode, effectiveMode, justification, subject } = request
+  // A same-mode request is a no-op: it asks for exactly the mode this call
+  // already runs under, granting nothing beyond what the caller holds — let
+  // it through without prompting. (Some models habitually re-declare
+  // sandbox_permissions; failing closed here would burn a turn on a no-op.)
+  if (mode === effectiveMode) return mode as SandboxMode
   // Strict widening is an EXECUTION check against the call's effective mode —
   // deliberately not a schema constraint (the enum is the closed target
   // vocabulary; the effective mode is per-call truth).

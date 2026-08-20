@@ -915,9 +915,29 @@ describe('sandbox escalation API (write/edit)', () => {
 
   it('rejects the escalation argument pairing (one field without the other)', async () => {
     const { ctx } = await setupConfining()
-    const missing = await call(ctx, 'write', { file_path: 'a.txt', content: 'x', sandbox_permissions: 'workspace-write' }, escalationAgent())
+    // A genuine escalation (danger-full-access from the workspace-write
+    // default) must still pair justification; only a same-mode request skips
+    // the pairing gate.
+    const missing = await call(ctx, 'write', { file_path: 'a.txt', content: 'x', sandbox_permissions: 'danger-full-access' }, escalationAgent())
     expect(missing.isError).toBe(true)
     expect(text(missing)).toContain('sandbox_permissions requires a justification')
+  })
+
+  it('grants a same-mode sandbox_permissions request without prompting (a no-op, even without a justification)', async () => {
+    const { ctx, fs } = await setupConfining({ approval: true })
+    const prompted = vi.fn()
+    ctx.on('approval/request', () => { prompted(); return Promise.resolve('allowed-once' as const) })
+    // Same mode as the standing default: passes through, no approval ask.
+    const withReason = await call(ctx, 'write', { file_path: 'a.txt', content: 'x', sandbox_permissions: 'workspace-write', justification: 'the test needs it' }, escalationAgent())
+    expect(withReason.isError).toBe(false)
+    // Same mode without a justification: pairing validation is skipped too.
+    const bare = await call(ctx, 'write', { file_path: 'a.txt', content: 'x', sandbox_permissions: 'workspace-write' }, escalationAgent())
+    expect(bare.isError).toBe(false)
+    expect(prompted).not.toHaveBeenCalled()
+    expect(fs.stamped).toEqual([
+      { mode: 'workspace-write', workspaceRoot: resolve('/session-project') },
+      { mode: 'workspace-write', workspaceRoot: resolve('/session-project') },
+    ])
   })
 
   it('sandbox_permissions under a non-confining backend fails closed (unadvertised field still reaches execute)', async () => {

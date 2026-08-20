@@ -73,11 +73,13 @@ export class FsSandboxController {
   }
 
   /**
-   * The policy to stamp onto this mutation: an approved escalation grant (a
-   * strictly wider retry resolved through `ctx.approval` before anything
-   * executes), else the session's standing mode. The calling session's cwd is
-   * always carried as the workspace root. Validates the escalation argument
-   * pairing first.
+   * The policy to stamp onto this mutation: a same-mode request grants nothing
+   * and passes through without the pairing check or an approval ask; an
+   * approved escalation grant is a strictly wider retry resolved through
+   * `ctx.approval` before anything executes; else the session's standing mode
+   * applies. The calling session's cwd is always carried as the workspace
+   * root. Validates the escalation argument pairing for genuine escalations
+   * only.
    * @param toolName - the mutating tool's name, for the approval audit trail.
    * @param args - the call's escalation arguments.
    * @param exec - the tool-execution context (agent, callId, signal).
@@ -85,9 +87,18 @@ export class FsSandboxController {
    *   unsandboxed backend.
    */
   async resolvePolicy(toolName: string, args: FsEscalationArgs, exec: ToolExecution): Promise<SandboxExecutionPolicy | undefined> {
-    validateEscalationArgs(args.sandbox_permissions, args.justification)
     const standingPolicy = this.policy?.resolve({ ...exec.agent ? { session: exec.agent.session } : {} })
-    if (args.sandbox_permissions === undefined || args.justification === undefined) {
+    // A same-mode sandbox_permissions request is a no-op — the call already
+    // runs under the requested mode, so grant it without the pairing check or
+    // an approval ask (approveEscalation shares the short-circuit as a
+    // backstop for direct callers).
+    const sameModeRequest = args.sandbox_permissions !== undefined
+      && standingPolicy !== undefined
+      && args.sandbox_permissions === standingPolicy.mode
+    if ((args.sandbox_permissions !== undefined || args.justification !== undefined) && !sameModeRequest) {
+      validateEscalationArgs(args.sandbox_permissions, args.justification)
+    }
+    if (args.sandbox_permissions === undefined || args.justification === undefined || sameModeRequest) {
       return standingPolicy
     }
     if (this.escalationModes.length === 0) {
