@@ -6,6 +6,9 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
+import { readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { agentEvents } from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -196,6 +199,43 @@ describe('Web session model selection', () => {
       error: { code: 'attachment-error', details: { reason: 'TOO_MANY_IMAGES' } },
     })
     expect(saveImage).toHaveBeenCalledTimes(2)
+    await ctx.fiber.dispose()
+  })
+
+  it('bridges pasted images to file notes for a text-only model', async () => {
+    const { ctx, agent, sessionId } = await harness()
+    registerTextOnly(ctx)
+    const followup = vi.fn()
+    Object.assign(agent, { followup })
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'text-only', model: 'plain' }),
+      cwd: '/tmp',
+    })
+    const previousHome = process.env.DSH_HOME
+    const bridgeHome = join(tmpdir(), `dsh-bridge-test-${process.pid}-${Date.now()}`)
+    process.env.DSH_HOME = bridgeHome
+    try {
+      const result = await api.sessions.prompt(request({
+        sessionId,
+        mode: 'queue' as const,
+        content: [
+          { type: 'text' as const, text: '看看这张图' },
+          { type: 'image' as const, mediaType: 'image/png' as const, data: 'AQI=' },
+        ],
+      }))
+      expect(result.result.ok).toBe(true)
+      const message = followup.mock.calls[0]?.[0] as UserMessage
+      expect(message.content).toHaveLength(2)
+      const note = message.content[1] as { type: 'text'; text: string } | undefined
+      expect(note?.type).toBe('text')
+      const path = note?.text.match(/已保存到 (.+?)，/)?.[1]
+      expect(path).toBeTruthy()
+      expect(await readFile(path as string, 'utf8')).toBe(Buffer.from('AQI=', 'base64').toString('utf8'))
+    } finally {
+      if (previousHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousHome
+      await rm(bridgeHome, { recursive: true, force: true })
+    }
     await ctx.fiber.dispose()
   })
 

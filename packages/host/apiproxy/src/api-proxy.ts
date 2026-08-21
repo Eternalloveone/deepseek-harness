@@ -4,17 +4,18 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdir, stat } from 'node:fs/promises'
+import { mkdir, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
 import { z as zod } from 'zod'
 import type { Context } from '@deepseek-ai/cordis'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Agent, ModelSelection, ModelSelectionRef, AgentOptions, AgentStatus } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-presets/types'
 import { AttachmentError, admitEncodedImages } from '@deepseek-ai/dsh-attachment'
-import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { createUserMessage, freezeMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { contentHasImage, createUserMessage, freezeMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { errorChain } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, MessageSource } from '@deepseek-ai/dsh-llm'
 import { isAppendSurfaceEvent, isJsonValue } from '@deepseek-ai/dsh-session'
@@ -27,7 +28,7 @@ import { isUserInvocable } from '@deepseek-ai/dsh-skill'
 import type { Workspace, WorkspaceRecord } from '@deepseek-ai/dsh-workspace'
 import {
   workspaceDomainState, workspaceRecord, WorkspaceId as brandWorkspaceId,
-  WorkspaceMoveInvalidError, WorkspaceOrderInvalidError, WorkspaceUnknownSessionError,
+  WorkspaceMoveInvalidError, WorkspaceOrderInvalidError, WorkspaceSessionRunningError, WorkspaceUnknownSessionError,
 } from '@deepseek-ai/dsh-workspace'
 // Type-only: brings the `ctx.tools` Context merge into this program (viewFor reads presenters).
 import {
@@ -136,6 +137,52 @@ async function durablePromptContent(ctx: Context, content: readonly PromptConten
     ? { type: 'text', text: part.text }
     // admitEncodedImages returns one reference per image part in order.
     : { type: 'image', attachment: refs[next++] as ImageAttachmentRef })
+}
+
+/** Media type → file extension for bridged image files. */
+const BRIDGE_EXT_BY_MEDIA: Record<ImageMediaType, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+}
+
+/**
+ * Image bridge for text-only models: persist pasted image bytes as files under
+ * the harness home and rewrite the prompt so every image part becomes a text
+ * note naming its file, which the model can hand to the `see_image` tool.
+ * Returns the rewritten content, or undefined when the bridge cannot run (the
+ * caller then falls back to the standard text-only rejection).
+ */
+async function bridgeImagesToNotes(
+  ctx: Context,
+  sessionId: string,
+  content: readonly PromptContentPart[],
+): Promise<readonly PromptContentPart[] | undefined> {
+  const images = content.filter(
+    (part): part is Extract<PromptContentPart, { type: 'image' }> => part.type === 'image',
+  )
+  if (images.length === 0) return undefined
+  try {
+    const root = join(resolveDshHome(), 'see-image-bridge', sessionId)
+    await mkdir(root, { recursive: true })
+    const notes: string[] = []
+    let index = 0
+    for (const part of images) {
+      const ext = BRIDGE_EXT_BY_MEDIA[part.mediaType] ?? 'img'
+      const target = join(root, `${String(index).padStart(2, '0')}-${randomUUID().slice(0, 8)}.${ext}`)
+      await writeFile(target, Buffer.from(part.data, 'base64'))
+      notes.push(`[用户粘贴了一张图片，已保存到 ${target}，请用 see_image 工具查看]`)
+      index += 1
+    }
+    let next = 0
+    return content.map(part => part.type === 'text'
+      ? part
+      : { type: 'text', text: notes[next++] as string })
+  } catch (error) {
+    ctx.logger.warn(`api-proxy: image bridge failed for a text-only model: ${String(error)}`)
+    return undefined
+  }
 }
 
 /** Search durable content for an image reference, including nested tool results. */
@@ -475,6 +522,7 @@ function sessionListUpdatedAt(header: SessionHeader, metadata: SessionListMetada
 /** Shared Session-header projection for list baselines and creation frames. */
 function sessionListFields(header: SessionHeader, events: readonly SessionEvent[] = []): {
   parentSessionId?: SessionId
+  seedLength?: number
   origin?: 'subagent'
   cwd?: string
   agentPreset?: string
@@ -485,6 +533,7 @@ function sessionListFields(header: SessionHeader, events: readonly SessionEvent[
   const agentPreset = resolveSessionPreset({ header, events })
   return {
     ...header.parentSession === undefined ? {} : { parentSessionId: header.parentSession },
+    ...header.seedLength === undefined ? {} : { seedLength: header.seedLength },
     ...header.origin === undefined ? {} : { origin: header.origin },
     ...header.cwd === undefined ? {} : { cwd: header.cwd },
     ...agentPreset === undefined ? {} : { agentPreset },
@@ -2356,11 +2405,13 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
             })
           }
         }
-        return ok(request, { sessionId: childId })
+        return ok(request, { sessionId: childId, seedLength: cut })
       },
 
       async prompt(request) {
-        const { sessionId, mode, content, clientTimeZone } = request.payload
+        const { sessionId, mode, content: rawContent, clientTimeZone } = request.payload
+        // The image bridge may rewrite the content for text-only models.
+        let content: readonly PromptContentPart[] = rawContent
         const canonicalTimeZone = clientTimeZone === undefined
           ? undefined
           : canonicalClientTimeZone(clientTimeZone)
@@ -2387,11 +2438,18 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
               const current = selectionFor(agent).current
               const modelInfo = await ctx.llm.resolveModelInfo(current.provider, current.model)
               if (modelInfo.inputModalities !== undefined && !modelInfo.inputModalities.includes('image')) {
-                return err(request, {
-                  code: 'attachment-error',
-                  message: `Model "${current.model}" does not support image input.`,
-                  details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' },
-                })
+                // Text-only model: bridge pasted images to files the model can
+                // hand to the see_image tool; fall back to the standard
+                // rejection when the bridge cannot run.
+                const bridged = await bridgeImagesToNotes(ctx, sessionId, content)
+                if (bridged === undefined) {
+                  return err(request, {
+                    code: 'attachment-error',
+                    message: `Model "${current.model}" does not support image input.`,
+                    details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' },
+                  })
+                }
+                content = bridged
               }
             }
             const durable = await durablePromptContent(ctx, content)
@@ -2807,6 +2865,47 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         const { sessionId } = request.payload
         try {
           await ctx.workspaceRegistry.archiveSession(sessionId)
+        } catch (error: unknown) {
+          // Only the registry's unknown-session rejection is the business
+          // code; storage/durability failures propagate as internal errors.
+          if (!(error instanceof WorkspaceUnknownSessionError)) throw error
+          return err(request, {
+            code: 'session-not-found',
+            message: error.message,
+            details: { sessionId },
+          })
+        }
+        return ok(request, { archivedSessionIds: [...ctx.workspaceRegistry.archivedSessionIds] })
+      },
+
+      async deleteSession(request) {
+        const { sessionId } = request.payload
+        try {
+          await ctx.workspaceRegistry.deleteSession(sessionId)
+        } catch (error: unknown) {
+          // Only the registry's running/unknown-session rejections are business
+          // code; storage/durability failures propagate as internal errors.
+          if (error instanceof WorkspaceSessionRunningError) {
+            return err(request, {
+              code: 'session-running',
+              message: error.message,
+              details: { sessionId },
+            })
+          }
+          if (!(error instanceof WorkspaceUnknownSessionError)) throw error
+          return err(request, {
+            code: 'session-not-found',
+            message: error.message,
+            details: { sessionId },
+          })
+        }
+        return ok(request, { archivedSessionIds: [...ctx.workspaceRegistry.archivedSessionIds] })
+      },
+
+      async unarchiveSession(request) {
+        const { sessionId } = request.payload
+        try {
+          await ctx.workspaceRegistry.unarchiveSession(sessionId)
         } catch (error: unknown) {
           // Only the registry's unknown-session rejection is the business
           // code; storage/durability failures propagate as internal errors.

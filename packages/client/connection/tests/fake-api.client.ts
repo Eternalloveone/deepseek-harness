@@ -47,7 +47,7 @@ export class FakeApiClient implements IApiClient {
     () => Promise.resolve(ok({ items: [], hasMore: false }))
   onCreate: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId }>> = () => Promise.resolve(ok({ sessionId: 'fk-new' as SessionId }))
   onRename: (payload: unknown) => Promise<RpcResponse<{ title: string; seq: number }>> = () => Promise.resolve(ok({ title: 'fk-renamed', seq: 0 }))
-  onFork: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId }>> = () => Promise.resolve(ok({ sessionId: 'fk-fork' as SessionId }))
+  onFork: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId; seedLength: number }>> = () => Promise.resolve(ok({ sessionId: 'fk-fork' as SessionId, seedLength: 0 }))
   onHistory: (payload: { sessionId: SessionId; beforeSeq?: number; maxMessages?: number })
   => Promise<RpcResponse<{ events: never[]; hasMore: boolean; modelSelection: ModelSelection }>> =
     () => Promise.resolve(ok({
@@ -166,6 +166,12 @@ export class FakeApiClient implements IApiClient {
       workspace: { workspaceId: 'fk-ws' as never, path: '/f/ws', title: 'ws', sessionIds: [], createdAt: '0', updatedAt: '0' },
     }))),
     archiveSession: (payload: unknown) => this.record('workspace.archiveSession', payload, Promise.resolve(ok({
+      archivedSessionIds: [(payload as { sessionId: SessionId }).sessionId],
+    }))),
+    deleteSession: (payload: unknown) => this.record('workspace.deleteSession', payload, Promise.resolve(ok({
+      archivedSessionIds: [],
+    }))),
+    unarchiveSession: (payload: unknown) => this.record('workspace.unarchiveSession', payload, Promise.resolve(ok({
       archivedSessionIds: [(payload as { sessionId: SessionId }).sessionId],
     }))),
   }
