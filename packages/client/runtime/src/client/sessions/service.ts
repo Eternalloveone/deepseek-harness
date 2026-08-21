@@ -53,6 +53,8 @@ export interface SessionSummary {
    */
   agentPreset?: string
   parentId?: SessionId
+  /** Fork seed cut (host summary passthrough); sibling forks sharing the same cut are versions of the same logical turn. */
+  seedLength?: number
   /** Coarse durable origin for navigation filtering; not a continuation capability. */
   origin?: 'subagent'
   running: boolean
@@ -681,6 +683,7 @@ export class SessionRuntime implements ISessions {
         ...(entry.title !== undefined ? { title: entry.title } : {}),
         ...(entry.cwd !== undefined ? { cwd: entry.cwd } : {}),
         ...(entry.parentSessionId !== undefined ? { parentId: entry.parentSessionId } : {}),
+        ...(entry.seedLength !== undefined ? { seedLength: entry.seedLength } : {}),
         ...(entry.origin !== undefined ? { origin: entry.origin } : {}),
         ...(entry.agentPreset !== undefined ? { agentPreset: entry.agentPreset } : {}),
       }

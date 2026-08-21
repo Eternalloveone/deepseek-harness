@@ -6,10 +6,10 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { stat } from 'node:fs/promises'
+import { rm, stat } from 'node:fs/promises'
 import { basename } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
-import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type { DomainGlobal, KvTable } from '@deepseek-ai/dsh-storage-domain'
 import { WorkspaceEntity } from './entity.ts'
@@ -49,6 +49,20 @@ export class WorkspaceUnknownSessionError extends Error {
   constructor(readonly sessionId: SessionId) {
     super(`cannot archive session '${sessionId}': live sessions and session persistence hold no such session`)
     this.name = 'WorkspaceUnknownSessionError'
+  }
+}
+
+/**
+ * A deleteSession request named a still-running session: its log is the
+ * agent's live working artifact and must not be removed under it.
+ */
+export class WorkspaceSessionRunningError extends Error {
+  /**
+   * @param sessionId - The live session id.
+   */
+  constructor(readonly sessionId: SessionId) {
+    super(`cannot delete session '${sessionId}': the session is still running`)
+    this.name = 'WorkspaceSessionRunningError'
   }
 }
 
@@ -252,6 +266,88 @@ export class WorkspaceRegistry extends Service {
       const state = this.requireState()
       await this.setState({ ...state, archivedSessionIds: [...state.archivedSessionIds, sessionId] })
     })
+  }
+
+  /**
+   * Remove one session from the registry-global archive set: it re-joins the
+   * grouping surfaces at its original accounting slot. The session must exist
+   * (live or in session persistence) and currently be archived.
+   * @param sessionId - The session to unarchive.
+   * @returns resolution after durability.
+   */
+  unarchiveSession(sessionId: SessionId): Promise<void> {
+    return this.enqueueOperation(async () => {
+      const state = this.requireState()
+      if (!state.archivedSessionIds.includes(sessionId)) {
+        throw new WorkspaceUnknownSessionError(sessionId)
+      }
+      if (!(await this.sessionKnown(sessionId))) {
+        throw new WorkspaceUnknownSessionError(sessionId)
+      }
+      await this.setState({ ...state, archivedSessionIds: state.archivedSessionIds.filter(id => id !== sessionId) })
+    })
+  }
+
+  /**
+   * Permanently delete one session: remove its persisted log directory and
+   * drop it from the live/header indices. The id joins the archive set so the
+   * UI propagates the removal through the exact same channel as
+   * {@link archiveSession} (and an eventual unarchive cannot resurrect a
+   * session whose log no longer exists — the registry refuses unknown ids).
+   * A still-running session fails with {@link WorkspaceSessionRunningError};
+   * a session neither live nor persisted fails with
+   * {@link WorkspaceUnknownSessionError}.
+   * @param sessionId - The session to delete.
+   * @returns resolution after durability.
+   */
+  deleteSession(sessionId: SessionId): Promise<void> {
+    return this.enqueueOperation(async () => {
+      // Only a genuinely running turn blocks deletion — a session that was
+      // merely opened (scoped) but has no open turn is deletable. Mirror the
+      // fork OPEN_TURN rule: the last turn-boundary event decides.
+      const live = this.ctx.get('sessions')?.get(sessionId)
+      if (live !== undefined && this.hasOpenTurn(live)) {
+        throw new WorkspaceSessionRunningError(sessionId)
+      }
+      if (!(await this.sessionKnown(sessionId))) {
+        throw new WorkspaceUnknownSessionError(sessionId)
+      }
+      // The header's persisted cwd locates the log directory; the deletion is
+      // confined to this session's own directory (basename must match).
+      const header = this.headers.get(sessionId)
+      const located = header === undefined
+        ? undefined
+        : this.ctx.sessionPersistence.locate(header)
+      if (located !== undefined && basename(located.path) === `session-${sessionId}`) {
+        await rm(located.path, { recursive: true, force: true })
+      }
+      this.headers.delete(sessionId)
+      this.sessionPaths.delete(sessionId)
+      this.invalidSessionPaths.delete(sessionId)
+      const state = this.requireState()
+      const archived = state.archivedSessionIds.includes(sessionId)
+        ? state.archivedSessionIds
+        : [...state.archivedSessionIds, sessionId]
+      await this.setState({ ...state, archivedSessionIds: archived })
+    })
+  }
+
+  /**
+   * Whether `session` has an open (still-running) turn: the last turn
+   * boundary event is a `turn/start` without a closing `turn/end`. Mirrors
+   * the fork boundary's OPEN_TURN rule.
+   * @param session - the live session.
+   * @returns true when a turn is currently running.
+   */
+  private hasOpenTurn(session: Session): boolean {
+    const events = session.events
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i]
+      if (event === undefined) continue
+      if (event.type === 'turn/end') return false
+      if (event.type === 'turn/start') return true
+    }
+    return false
   }
 
   /**

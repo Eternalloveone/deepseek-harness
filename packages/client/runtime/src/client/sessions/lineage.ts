@@ -22,6 +22,8 @@ export interface SessionListEntry {
   /** Empty-log bit mirrored from the summary; lists hide blank sessions (filtering stays with the consumer). */
   blank: boolean
   parentSessionId?: SessionId
+  /** Fork seed cut (host summary passthrough); sibling forks sharing the same cut are versions of the same logical turn. */
+  seedLength?: number
   /** Coarse durable origin for navigation filtering; not a continuation capability. */
   origin?: 'subagent'
   cwd?: string

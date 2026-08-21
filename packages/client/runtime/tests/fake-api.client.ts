@@ -80,7 +80,7 @@ export class FakeApiClient implements IApiClient {
   onCreate: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId }>> = () => Promise.resolve(ok({ sessionId: 'fk-new' as SessionId }))
   readonly defaultModel: ModelSelection = { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
   onRename: (payload: unknown) => Promise<RpcResponse<{ title: string; seq: number }>> = () => Promise.resolve(ok({ title: 'fk-renamed', seq: 0 }))
-  onFork: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId }>> = () => Promise.resolve(ok({ sessionId: 'fk-fork' as SessionId }))
+  onFork: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId; seedLength: number }>> = () => Promise.resolve(ok({ sessionId: 'fk-fork' as SessionId, seedLength: 0 }))
   onHistory: (payload: { sessionId: SessionId; beforeSeq?: number; maxMessages?: number })
   => Promise<RpcResponse<{ events: never[]; hasMore: boolean }>> =
     () => Promise.resolve(ok({ events: [], hasMore: false }))
@@ -220,6 +220,10 @@ export class FakeApiClient implements IApiClient {
       this.record('workspace.insertSessionBefore', payload, this.onWorkspaceInsertSessionBefore(payload)),
     archiveSession: (payload: unknown) =>
       this.record('workspace.archiveSession', payload, this.onWorkspaceArchiveSession(payload)),
+    deleteSession: (payload: unknown) =>
+      this.record('workspace.deleteSession', payload, Promise.resolve(ok({ archivedSessionIds: [] }))),
+    unarchiveSession: (payload: unknown) =>
+      this.record('workspace.unarchiveSession', payload, Promise.resolve(ok({ archivedSessionIds: [(payload as { sessionId: SessionId }).sessionId] }))),
   }
 
   // Payloads stay `unknown` (lint-lane note above); response rows are the real

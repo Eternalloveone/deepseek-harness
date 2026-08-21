@@ -9,6 +9,251 @@ import {
   type WorkspaceId, type WorkspaceView,
 } from '@deepseek-ai/dsh-client-runtime/client'
 
+/**
+ * localStorage key of the dsh-webchatlike version tree
+ * (`{ [atSeq]: { original, versions, times } }`). `versions` members are
+ * version forks (regenerate / edit-and-resend children) and are hidden from
+ * the sidebar; the `original` session stays visible. Cross-plugin convention
+ * with dsh-webchatlike; reads are fully defensive — a missing, stale, or
+ * malformed tree must never take the sidebar down.
+ */
+const VERSION_TREE_KEY = 'dsh-webchatlike:version-tree'
+
+/** Parsed version-tree turns (`{ original, versions }`), defensive: empty when missing/unreadable. */
+function versionTreeEntries(): { original: string; versions: string[] }[] {
+  let raw: string | null = null
+  try {
+    raw = typeof localStorage === 'undefined' ? null : localStorage.getItem(VERSION_TREE_KEY)
+  } catch {
+    return []
+  }
+  if (raw === null) return []
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return []
+  const entries: { original: string; versions: string[] }[] = []
+  for (const value of Object.values(parsed as Record<string, unknown>)) {
+    const entry = value as { original?: unknown; versions?: unknown } | null
+    if (entry === null || typeof entry !== 'object') continue
+    if (typeof entry.original !== 'string' || !Array.isArray(entry.versions)) continue
+    entries.push({
+      original: entry.original,
+      versions: (entry.versions as unknown[]).filter((v): v is string => typeof v === 'string' && v !== ''),
+    })
+  }
+  return entries
+}
+
+/** Fork → immediate original map across every recorded turn (defensive). */
+function forkOriginalMap(): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const entry of versionTreeEntries()) {
+    for (const version of entry.versions) map.set(version, entry.original)
+  }
+  return map
+}
+
+/**
+ * Resolve the ROOT ORIGINAL session id of a version fork from the chat-actions
+ * version tree (`{ [atSeq]: { original, versions } }`). A session listed in
+ * any turn's `versions` is a fork of that turn's `original`; because forks can
+ * be forked again (regenerate/edit inside a version), the walk continues up
+ * the fork chain until the ROOT original (the first session of the
+ * conversation) is reached. Returns undefined when the session is not a
+ * recorded fork or the tree is missing/unreadable. Never throws.
+ */
+function versionOriginalOf(sessionId: SessionId): SessionId | undefined {
+  const forkOriginal = forkOriginalMap()
+  let cursor: string | undefined = sessionId
+  const seen = new Set<string>()
+  while (cursor !== undefined && !seen.has(cursor)) {
+    seen.add(cursor)
+    const parent = forkOriginal.get(cursor)
+    if (parent === undefined) return cursor === sessionId ? undefined : (cursor as SessionId)
+    cursor = parent
+  }
+  return undefined // cycle: malformed tree
+}
+
+/**
+ * Session ids hidden from the sidebar as version-family members: the version
+ * forks recorded in the version tree (regenerate/edit children). Forks
+ * created by the sidebar's own fork action are NOT recorded there and stay
+ * visible as ordinary rows — matching the stock fork behavior. Family members
+ * are ALWAYS hidden — the currently open one included — so a conversation
+ * shows exactly one sidebar row (its root original); the open member is
+ * presented through its root row via {@link versionAliasedCurrent}.
+ * Archived/blank/subagent rules still apply on top. Returns an empty set when
+ * the tree is missing or unreadable, never throws.
+ */
+export function hiddenVersionSessionIds(): ReadonlySet<string> {
+  const hidden = new Set<string>()
+  for (const entry of versionTreeEntries()) {
+    for (const id of entry.versions) hidden.add(id)
+  }
+  return hidden
+}
+
+/**
+ * The session the sidebar should treat as current when the open session is a
+ * hidden version-family member: the family's ROOT original row represents the
+ * conversation, so highlight/group logic maps the member to its root. Returns
+ * the session unchanged when it is not part of any recorded family. Never
+ * throws.
+ * @param current - the open session id.
+ */
+export function versionAliasedCurrent(current: SessionId | undefined): SessionId | undefined {
+  if (current === undefined) return undefined
+  return versionOriginalOf(current) ?? current
+}
+
+/**
+ * Every member of the version family rooted at `sessionId`'s root original:
+ * the root, recorded version forks (regenerate/edit children, including
+ * forks-of-forks), and host parent-chain descendants (sidebar forks). Used by
+ * family-wide sidebar actions (rename / archive / delete). Subagent children
+ * are excluded — the harness owns them. Never throws.
+ * @param sessionId - any family member (the root row, or a hidden member).
+ * @param byId - live session summaries by id (host parent chain).
+ * @returns the member ids, root first, in discovery order.
+ */
+export function versionFamilyMembers(
+  sessionId: SessionId,
+  byId: Readonly<Record<SessionId, SessionSummary>>,
+): SessionId[] {
+  const summaries = byId as Readonly<Record<string, SessionSummary>>
+  const forkOriginal = forkOriginalMap()
+  /** Walk the version-tree fork chain upward from `id`; its root, or undefined when `id` is not a recorded fork. */
+  const walkVersionTree = (id: string): string | undefined => {
+    let cursor: string | undefined = id
+    const seen = new Set<string>()
+    while (cursor !== undefined && !seen.has(cursor)) {
+      seen.add(cursor)
+      const parent = forkOriginal.get(cursor)
+      if (parent === undefined) return cursor === id ? undefined : cursor
+      cursor = parent
+    }
+    return undefined // cycle: malformed tree
+  }
+  // Family root: the version-tree root when `sessionId` is a recorded member;
+  // otherwise walk the HOST parent chain to the nearest version-tree member
+  // (a sidebar-forked child of the family) and use ITS root.
+  let root = walkVersionTree(sessionId)
+  if (root === undefined) {
+    const treeMembers = new Set<string>()
+    for (const [fork, original] of forkOriginal) {
+      treeMembers.add(fork)
+      treeMembers.add(original)
+    }
+    let cursor = summaries[sessionId]?.parentId
+    const seen = new Set<string>([sessionId])
+    while (cursor !== undefined && !seen.has(cursor)) {
+      seen.add(cursor)
+      if (treeMembers.has(cursor)) {
+        root = walkVersionTree(cursor) ?? cursor
+        break
+      }
+      cursor = summaries[cursor]?.parentId
+    }
+  }
+  const rootId = root ?? sessionId
+  // Child edges: recorded version forks + live host parent relationships
+  // (non-subagent only — the harness owns subagent children).
+  const children = new Map<string, string[]>()
+  const addChild = (parent: string, child: string): void => {
+    const list = children.get(parent) ?? []
+    list.push(child)
+    children.set(parent, list)
+  }
+  for (const [fork, original] of forkOriginal) addChild(original, fork)
+  for (const id of Object.keys(summaries)) {
+    const session = summaries[id]
+    if (session === undefined || session.origin === 'subagent') continue
+    const parent = session.parentId
+    if (parent !== undefined) addChild(parent, id)
+  }
+  const members: SessionId[] = []
+  const seen = new Set<string>()
+  const queue = [rootId]
+  while (queue.length > 0) {
+    const id = queue.shift() as string
+    if (seen.has(id)) continue
+    seen.add(id)
+    members.push(id as SessionId)
+    for (const child of children.get(id) ?? []) queue.push(child as SessionId)
+  }
+  return members
+}
+
+/**
+ * localStorage key of the chat-actions "last viewed version" map
+ * (`{ [originalId]: sessionId }`). Written by the version pager whenever the
+ * user views a version of a conversation; the sidebar restores it when the
+ * conversation's row is opened, so paging to version 2 and visiting another
+ * conversation does not throw the conversation back to version 1. Cross-plugin
+ * convention with dsh-webchatlike; reads are fully defensive.
+ */
+const LAST_VERSION_KEY = 'dsh-webchatlike:last-version'
+
+/**
+ * The last version session the user viewed in `originalId`, or undefined when
+ * none is recorded (or the record is missing/unreadable). Never throws.
+ */
+export function lastViewedVersionOf(originalId: SessionId): SessionId | undefined {
+  try {
+    const raw = typeof localStorage === 'undefined' ? null : localStorage.getItem(LAST_VERSION_KEY)
+    if (raw === null) return undefined
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const viewed = (parsed as Record<string, unknown>)[originalId]
+    return typeof viewed === 'string' && viewed !== '' ? (viewed as SessionId) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Effective recency per session for the sidebar's activity ordering: each
+ * session's own `updatedAt`, except that a hidden version fork's activity
+ * counts toward its ROOT original row (the visible representation of that
+ * conversation) — propagated up the whole fork chain, so chatting inside any
+ * version (including a version of a version) still floats the conversation to
+ * the top of the sidebar. Sessions absent from `byId` are dropped; the map
+ * contains only live sessions. Never throws.
+ * @param byId - live session summaries by id.
+ * @returns effective `updatedAt` by session id.
+ */
+export function effectiveUpdatedAtById(byId: Readonly<Record<SessionId, SessionSummary>>): Map<string, number> {
+  const summaries = byId as Readonly<Record<string, SessionSummary>>
+  const effective = new Map<string, number>()
+  for (const id of Object.keys(summaries)) {
+    const session = summaries[id]
+    if (session !== undefined) effective.set(id, session.updatedAt)
+  }
+  const forkOriginal = forkOriginalMap()
+  for (const forkId of forkOriginal.keys()) {
+    const timestamp = summaries[forkId]?.updatedAt
+    if (timestamp === undefined) continue
+    let cursor: string | undefined = forkId
+    const seen = new Set<string>()
+    while (cursor !== undefined && !seen.has(cursor)) {
+      seen.add(cursor)
+      const parent = forkOriginal.get(cursor)
+      if (parent === undefined) break
+      const current = effective.get(parent)
+      if (current === undefined) break
+      if (current >= timestamp) break // the ancestor is already at least as fresh; nothing above can be older
+      effective.set(parent, timestamp)
+      cursor = parent
+    }
+  }
+  return effective
+}
+
 /** Group key for Sessions outside every Workspace. */
 export const UNGROUPED_KEY = ''
 
@@ -104,8 +349,10 @@ export function workspaceLabel(cwd: string | undefined): string {
 }
 
 /** Recency comparator: newest first, id as the deterministic tiebreak (ids are unique per group). */
-function byRecency(a: SessionSummary, b: SessionSummary): number {
-  if (b.updatedAt !== a.updatedAt) return b.updatedAt - a.updatedAt
+function byRecency(a: SessionSummary, b: SessionSummary, effective: ReadonlyMap<string, number>): number {
+  const aUpdatedAt = effective.get(a.id) ?? a.updatedAt
+  const bUpdatedAt = effective.get(b.id) ?? b.updatedAt
+  if (bUpdatedAt !== aUpdatedAt) return bUpdatedAt - aUpdatedAt
   return a.id < b.id ? -1 : 1
 }
 
@@ -113,21 +360,42 @@ function byRecency(a: SessionSummary, b: SessionSummary): number {
  * Ordinary sessions are visible; among blank sessions, only the current one
  * is visible. Subagent children use their parent header catalog; archived
  * sessions are visible nowhere, while their accounting slots remain so
- * unarchiving restores position.
+ * unarchiving restores position. Version forks (regenerate / edit-and-resend
+ * children recorded by the chat-actions ledger) are ALWAYS hidden — the
+ * conversation appears as its original row only, even while a fork is the
+ * open session.
  */
-function sessionVisible(session: SessionSummary, current: SessionId | undefined, archived: ReadonlySet<SessionId>): boolean {
+function sessionVisible(
+  session: SessionSummary,
+  current: SessionId | undefined,
+  archived: ReadonlySet<SessionId>,
+  hidden: ReadonlySet<string>,
+): boolean {
   return session.origin !== 'subagent'
     && !archived.has(session.id)
+    && !hidden.has(session.id)
     && (!session.blank || session.id === current)
 }
 
 /**
- * A blank session is the selected Workspace's provisional New Session row;
- * its canonical title never enters search (blank rows are query-excluded)
- * and the renderer localizes its display label.
+ * The display title of a session row, with version-fork aliasing: a version
+ * fork (regenerate/edit child recorded in the chat-actions version tree)
+ * shows its ORIGINAL session's title instead of the auto-numbered fork title
+ * ("你好呀 (1)"), so switching versions never looks like the conversation
+ * changed identity. Falls back to the session's own title when no alias
+ * applies. Reads are fully defensive.
+ * @param session - the row being titled.
+ * @param byId - session summaries by id (to resolve the original's title).
+ * @returns the display title.
  */
-function sessionTitle(session: SessionSummary): string {
-  return session.blank ? 'New Session' : session.displayTitle
+function aliasedSessionTitle(session: SessionSummary, byId: Readonly<Record<string, SessionSummary>>): string {
+  if (session.blank) return 'New Session'
+  const originalId = versionOriginalOf(session.id)
+  if (originalId !== undefined) {
+    const original = byId[originalId]
+    if (original !== undefined) return original.displayTitle
+  }
+  return session.displayTitle
 }
 
 /** Build one group without projecting session lineage into presentation. */
@@ -139,16 +407,21 @@ function buildGroup(
   label: string,
   members: readonly SessionSummary[],
   order: 'account' | 'recency',
+  effective: ReadonlyMap<string, number>,
 ): Group {
   const sessions = [...members]
   // Real Workspace order comes from sessionIds. Ungrouped falls back to
   // recency until the browser supplies its persisted local order.
-  if (order === 'recency') sessions.sort(byRecency)
+  if (order === 'recency') sessions.sort((a, b) => byRecency(a, b, effective))
   return { key, workspaceId, cwd, createdAt, label, sessions }
 }
 
 /** Apply a stored Ungrouped order and append newly loose Sessions by recency. */
-function orderedUngrouped(members: readonly SessionSummary[], stored: readonly string[]): SessionSummary[] {
+function orderedUngrouped(
+  members: readonly SessionSummary[],
+  stored: readonly string[],
+  effective: ReadonlyMap<string, number>,
+): SessionSummary[] {
   const byId = new Map(members.map(session => [session.id as string, session]))
   const included = new Set<string>()
   const ordered: SessionSummary[] = []
@@ -158,7 +431,7 @@ function orderedUngrouped(members: readonly SessionSummary[], stored: readonly s
     ordered.push(session)
     included.add(key)
   }
-  for (const session of [...members].sort(byRecency)) {
+  for (const session of [...members].sort((a, b) => byRecency(a, b, effective))) {
     if (included.has(session.id)) continue
     ordered.push(session)
   }
@@ -175,7 +448,9 @@ function groupByWorkspace(
   list: SessionListState,
   workspaces: readonly WorkspaceView[],
   archived: ReadonlySet<SessionId>,
+  hidden: ReadonlySet<string>,
   ungroupedOrder: readonly string[] | undefined,
+  effective: ReadonlyMap<string, number>,
 ): Group[] {
   const groups: Group[] = []
   const accounted = new Set<SessionId>()
@@ -185,18 +460,18 @@ function groupByWorkspace(
       const summary = list.byId[id]
       if (summary === undefined) continue // account may lead the list pull; the row appears when the summary lands
       accounted.add(id)
-      if (!sessionVisible(summary, list.current, archived)) continue
+      if (!sessionVisible(summary, list.current, archived, hidden)) continue
       members.push(summary)
     }
     groups.push(buildGroup(
       workspace.workspaceId, workspace.workspaceId, workspace.path,
-      Date.parse(workspace.createdAt), workspace.title, members, 'account',
+      Date.parse(workspace.createdAt), workspace.title, members, 'account', effective,
     ))
   }
   const stray = list.ids
     .map(id => list.byId[id])
     .filter((s): s is SessionSummary =>
-      s !== undefined && !accounted.has(s.id) && sessionVisible(s, list.current, archived))
+      s !== undefined && !accounted.has(s.id) && sessionVisible(s, list.current, archived, hidden))
   if (stray.length > 0) {
     groups.push(buildGroup(
       UNGROUPED_KEY,
@@ -204,8 +479,9 @@ function groupByWorkspace(
       undefined,
       undefined,
       UNGROUPED_LABEL,
-      ungroupedOrder === undefined ? stray : orderedUngrouped(stray, ungroupedOrder),
+      ungroupedOrder === undefined ? stray : orderedUngrouped(stray, ungroupedOrder, effective),
       ungroupedOrder === undefined ? 'recency' : 'account',
+      effective,
     ))
   }
   return groups
@@ -214,10 +490,11 @@ function groupByWorkspace(
 function sessionNode(
   s: SessionSummary,
   descendants: ReadonlyMap<SessionId, SubagentDescendantSummary>,
+  byId: Readonly<Record<string, SessionSummary>>,
 ): SessionNode {
   return {
     id: s.id,
-    title: sessionTitle(s),
+    title: aliasedSessionTitle(s, byId),
     blank: s.blank,
     running: s.running,
     runningSubagentCount: descendants.get(s.id)?.runningCount ?? 0,
@@ -235,7 +512,9 @@ function sessionNode(
  * provisional New Session row; archived sessions are excluded everywhere.
  * Content search lives outside this derivation
  * (see {@link deriveSearchResults}).
- * @param list - sessions list snapshot (`current` feeds containsCurrent).
+ * @param list - sessions list snapshot (`current` feeds containsCurrent via
+ * {@link versionAliasedCurrent}: an open version fork highlights its
+ * original's group).
  * @param workspaces - real workspaces in stable Host order.
  * @param archivedSessionIds - registry-global archive set.
  * @param view - local expansion arrays.
@@ -248,14 +527,17 @@ export function deriveGroups(
   view: TreeView,
 ): GroupNode[] {
   const archived = new Set(archivedSessionIds)
+  const hidden = hiddenVersionSessionIds()
   const expandedGroups = new Set(view.expandedGroups)
   const descendants = indexSubagentDescendants(list.byId)
-  const currentGroup = list.current === undefined
+  const effective = effectiveUpdatedAtById(list.byId)
+  const current = versionAliasedCurrent(list.current)
+  const currentGroup = current === undefined
     ? undefined
-    : (workspaces.find(w => w.sessionIds.includes(list.current as SessionId))?.workspaceId as string | undefined)
+    : (workspaces.find(w => w.sessionIds.includes(current as SessionId))?.workspaceId as string | undefined)
         ?? UNGROUPED_KEY
   const groups: GroupNode[] = []
-  for (const g of groupByWorkspace(list, workspaces, archived, view.ungroupedOrder)) {
+  for (const g of groupByWorkspace(list, workspaces, archived, hidden, view.ungroupedOrder, effective)) {
     const expanded = expandedGroups.has(g.key)
     groups.push({
       key: g.key,
@@ -266,7 +548,11 @@ export function deriveGroups(
       sessionCount: g.sessions.length,
       expanded,
       containsCurrent: g.key === currentGroup,
-      sessions: expanded ? g.sessions.map(session => sessionNode(session, descendants)) : [],
+      sessions: expanded
+        ? g.sessions.map(session => sessionNode(
+          session, descendants, list.byId as unknown as Record<string, SessionSummary>,
+        ))
+        : [],
     })
   }
   return groups
@@ -286,15 +572,17 @@ export function deriveFlat(
   archivedSessionIds: readonly SessionId[],
 ): SessionNode[] {
   const archived = new Set(archivedSessionIds)
+  const hidden = hiddenVersionSessionIds()
   const descendants = indexSubagentDescendants(list.byId)
+  const effective = effectiveUpdatedAtById(list.byId)
   const rows: SessionSummary[] = []
   for (const id of list.ids) {
     const s = list.byId[id]
-    if (s === undefined || !sessionVisible(s, list.current, archived)) continue
+    if (s === undefined || !sessionVisible(s, list.current, archived, hidden)) continue
     rows.push(s)
   }
-  rows.sort(byRecency)
-  return rows.map(session => sessionNode(session, descendants))
+  rows.sort((a, b) => byRecency(a, b, effective))
+  return rows.map(session => sessionNode(session, descendants, list.byId as unknown as Record<string, SessionSummary>))
 }
 
 /** Relative-time bucket of a session row's trailing label. */
@@ -329,6 +617,9 @@ export function deriveSearchResults(
   const q = query.trim().toLowerCase()
   if (q === '') return { items: [], hasMore: false }
   const archived = new Set(archivedSessionIds)
+  // Search deliberately does NOT hide version forks: it is the escape hatch
+  // to reach a fork the sidebar keeps out of sight.
+  const hidden: ReadonlySet<string> = new Set()
   const descendants = indexSubagentDescendants(list.byId)
 
   const workspaceBySession = new Map<SessionId, string>()
@@ -349,15 +640,15 @@ export function deriveSearchResults(
     const summary = list.byId[id]
     // Blank placeholders never match a query (their canonical title displays
     // localized, so matching it would tie search to one language).
-    if (summary === undefined || summary.blank || !sessionVisible(summary, list.current, archived)) continue
+    if (summary === undefined || summary.blank || !sessionVisible(summary, list.current, archived, hidden)) continue
     if (
-      sessionTitle(summary).toLowerCase().includes(q)
+      aliasedSessionTitle(summary, list.byId as unknown as Record<string, SessionSummary>).toLowerCase().includes(q)
       || labelOf(summary).toLowerCase().includes(q)
     ) {
       local.push(summary)
     }
   }
-  local.sort(byRecency)
+  local.sort((a, b) => byRecency(a, b, effectiveUpdatedAtById(list.byId)))
 
   const ordered: SessionSummary[] = []
   const included = new Set<SessionId>()
@@ -369,7 +660,7 @@ export function deriveSearchResults(
   for (const summary of local) include(summary)
   for (const item of content.items) {
     const summary = list.byId[item.sessionId]
-    if (summary !== undefined && !summary.blank && sessionVisible(summary, list.current, archived)) include(summary)
+    if (summary !== undefined && !summary.blank && sessionVisible(summary, list.current, archived, hidden)) include(summary)
   }
 
   return {
@@ -377,7 +668,7 @@ export function deriveSearchResults(
       const match = contentBySession.get(summary.id)
       return {
         id: summary.id,
-        title: sessionTitle(summary),
+        title: aliasedSessionTitle(summary, list.byId as unknown as Record<string, SessionSummary>),
         workspace: labelOf(summary),
         running: summary.running,
         runningSubagentCount: descendants.get(summary.id)?.runningCount ?? 0,
@@ -390,6 +681,41 @@ export function deriveSearchResults(
     }),
     hasMore: content.hasMore || ordered.length > limit,
   }
+}
+
+/**
+ * Derive archived sessions as flat rows for the archived view. Unlike the
+ * main browser (groups/flat/search), archived sessions bypass all filtering
+ * except blank-subagent and hidden-version-fork, so the user can see every
+ * archived session and unarchive it.
+ * @param list - session metadata authority.
+ * @param archivedSessionIds - registry-global archive set (these are the only visible rows).
+ * @returns flat array of archived session nodes.
+ */
+export function deriveArchived(
+  list: SessionListState,
+  archivedSessionIds: readonly SessionId[],
+): SessionNode[] {
+  const hidden = hiddenVersionSessionIds()
+  const descendants = indexSubagentDescendants(list.byId)
+  const rows: SessionNode[] = []
+  for (const id of archivedSessionIds) {
+    const summary = list.byId[id]
+    if (summary === undefined || summary.blank || hidden.has(id)) continue
+    rows.push({
+      id: summary.id,
+      title: aliasedSessionTitle(summary, list.byId as unknown as Record<string, SessionSummary>),
+      blank: false,
+      running: summary.running,
+      runningSubagentCount: descendants.get(summary.id)?.runningCount ?? 0,
+      completed: summary.completed === true,
+      updatedAt: summary.updatedAt,
+      ...(summary.pendingInteraction === undefined
+        ? {}
+        : { pendingInteraction: summary.pendingInteraction }),
+    })
+  }
+  return rows
 }
 
 /**

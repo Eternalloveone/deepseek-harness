@@ -6,6 +6,9 @@
   flex-direction: column;
   align-items: flex-end;
   gap: 6px;
+  /* Anchor for in-place edit overlays contributed through the
+     conversation.chat.user-actions slot (positioned absolutely over this row). */
+  position: relative;
 }
 
 .userStack {

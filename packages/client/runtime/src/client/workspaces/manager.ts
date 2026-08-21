@@ -232,6 +232,31 @@ export class WorkspaceManager {
   }
 
   /**
+   * Permanently delete one session (host removes its persisted log; the id
+   * joins the archive set so the row disappears through the same channel as
+   * archive). The updated full set is installed immediately.
+   * @param sessionId - session to delete.
+   * @returns the wire result.
+   */
+  async deleteSession(sessionId: SessionId): Promise<RpcResult<{ archivedSessionIds: SessionId[] }>> {
+    const { result } = await this.api.workspace.deleteSession({ sessionId })
+    if (result.ok) this.installArchived(result.value.archivedSessionIds)
+    return result
+  }
+
+  /**
+   * Remove one session from the registry-global archive set; the updated full
+   * set is installed immediately.
+   * @param sessionId - session to unarchive.
+   * @returns the wire result.
+   */
+  async unarchiveSession(sessionId: SessionId): Promise<RpcResult<{ archivedSessionIds: SessionId[] }>> {
+    const { result } = await this.api.workspace.unarchiveSession({ sessionId })
+    if (result.ok) this.installArchived(result.value.archivedSessionIds)
+    return result
+  }
+
+  /**
    * Host-frame entry. Non-workspace frames are ignored so the runtime can
    * fan one host stream out to both object managers.
    * @param envelope - host stream envelope.

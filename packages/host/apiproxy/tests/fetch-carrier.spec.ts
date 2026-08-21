@@ -91,7 +91,7 @@ function fakeApi(overrides: Partial<{ muxFrames: MuxFrame[]; hostFrames: HostFra
         return { rpcId: request.rpcId, result: { ok: true, value: { title: request.payload.title, seq: 0 } } }
       },
       async fork(request) {
-        return { rpcId: request.rpcId, result: { ok: true, value: { sessionId: 's-fork' as never } } }
+        return { rpcId: request.rpcId, result: { ok: true, value: { sessionId: 's-fork' as never, seedLength: 0 } } }
       },
       async prompt(request) {
         return { rpcId: request.rpcId, result: { ok: true, value: { accepted: true as const } } }
@@ -189,6 +189,12 @@ function fakeApi(overrides: Partial<{ muxFrames: MuxFrame[]; hostFrames: HostFra
         }
       },
       async archiveSession(request) {
+        return { rpcId: request.rpcId, result: { ok: true, value: { archivedSessionIds: [request.payload.sessionId] } } }
+      },
+      async deleteSession(request) {
+        return { rpcId: request.rpcId, result: { ok: true, value: { archivedSessionIds: [] } } }
+      },
+      async unarchiveSession(request) {
         return { rpcId: request.rpcId, result: { ok: true, value: { archivedSessionIds: [request.payload.sessionId] } } }
       },
     },

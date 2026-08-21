@@ -55,6 +55,7 @@ export const sessionSummarySchema = z.object({
   running: z.boolean(),
   blank: z.boolean(),
   parentSessionId: sessionIdSchema.optional(),
+  seedLength: z.number().int().nonnegative().optional(),
   origin: z.literal('subagent').optional(),
   cwd: z.string().optional(),
   agentPreset: z.string().optional(),
@@ -133,9 +134,10 @@ export const sessionForkRequestSchema = z.object({
   atSeq: z.number().int().nonnegative().optional(),
 }) satisfies z.ZodType<Wire<RequestPayload<'session.fork'>>>
 
-/** session.fork response value (the child session id). */
+/** session.fork response value (the child session id and its seedLength cut). */
 export const sessionForkValueSchema = z.object({
   sessionId: sessionIdSchema,
+  seedLength: z.number().int().nonnegative(),
 }) satisfies z.ZodType<Wire<ResponseValue<'session.fork'>>>
 
 /** session.history request payload (beforeSeq/maxMessages page backwards from the window tail). */
@@ -231,7 +233,6 @@ export const imageLimitsProjectionSchema = z.object({
   maxImagesPerMessage: z.number().int().positive(),
   maxMessageImageBytes: z.number().int().positive(),
   maxImagePixels: z.number().int().positive(),
-  maxImageDimension: z.number().int().positive(),
   mediaTypes: z.array(z.string()),
 }) as unknown as z.ZodType<ImageAttachmentLimits>
 

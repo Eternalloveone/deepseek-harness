@@ -533,7 +533,7 @@ describe('fork', () => {
       payload: { type: 'session/projection', sessionId: sid('source'), key: 'title', value: sourceTitle, seq: 2 } as never,
     })
     await feedList(b, [{ id: 'source', cwd: '/work' }])
-    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') }))
+    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child'), seedLength: 0 }))
     b.api.onRename = (payload) => {
       const { title } = payload as { title: string }
       return Promise.resolve(ok({ title, seq: 3 }))
@@ -556,7 +556,7 @@ describe('fork', () => {
   it('floors a fractional anchor to the real event seq the wire accepts', async () => {
     const b = bench()
     await feedList(b, [{ id: 'source', cwd: '/work' }])
-    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') }))
+    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child'), seedLength: 0 }))
 
     // The frozen node of an interrupted turn carries turnEnd.seq - 0.9.
     await expect(b.svc.fork({ sessionId: sid('source'), atSeq: 41.1 })).resolves.toBe('child')
@@ -567,11 +567,11 @@ describe('fork', () => {
   it('does not rename without the title policy or a durable source title', async () => {
     const b = bench()
     await feedList(b, [{ id: 'source', cwd: '/work' }])
-    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') }))
+    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child'), seedLength: 0 }))
     await expect(b.svc.fork({ sessionId: sid('source'), increaseTitle: true })).resolves.toBe('child')
     expect(b.api.callsOf('session.rename')).toEqual([])
 
-    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child-2') }))
+    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child-2'), seedLength: 0 }))
     await expect(b.svc.fork({ sessionId: sid('source') })).resolves.toBe('child-2')
     expect(b.api.callsOf('session.rename')).toEqual([])
   })
@@ -583,7 +583,7 @@ describe('fork', () => {
       payload: { type: 'session/projection', sessionId: sid('source'), key: 'title', value: 'Roadmap', seq: 2 } as never,
     })
     await feedList(b, [{ id: 'source' }])
-    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') }))
+    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child'), seedLength: 0 }))
     b.api.onRename = () => Promise.resolve(err({
       code: 'title-invalid', message: 'rejected', details: { sessionId: sid('child') },
     }))

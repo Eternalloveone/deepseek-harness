@@ -18,7 +18,7 @@ import {
   formatMessageClock, msUntilNextLocalMidnight, startOfLocalDay,
 } from '../src/client/chat/message-chrome.ts'
 import {
-  CompactionNodeView, ContextMessageNodeView, RetryNodeView, UnknownNodeView,
+  CompactionNodeView, ContextMessageNodeView, RetryNodeView, SteeringMessageNodeView, UnknownNodeView,
   UserMessageNodeView,
 } from '../src/client/chat/MessageItem.tsx'
 import { AssistantMarkdown, type AssistantMarkdownProps } from '../src/client/chat/AssistantMarkdown.tsx'
@@ -71,8 +71,15 @@ function MessageItem({ node, t: translate, referenceLabels }: MessageItemProps) 
   const props = { node: viewNode, t: translate, renderMessageImages } as ChatNodeViewProps
   switch (node.kind) {
     case 'user':
+      return (
+        <UserMessageNodeView
+          {...props as ChatNodeViewProps<'user'>}
+          renderSlot={((_key: string, _owner: object) => null) as unknown as React.ComponentProps<typeof UserMessageNodeView>['renderSlot']}
+          SessionProvider={(({ children }: { children: (sessionId: string) => React.ReactNode }) => <>{children('session')}</>) as unknown as React.ComponentProps<typeof UserMessageNodeView>['SessionProvider']}
+        />
+      )
     case 'steering':
-      return <UserMessageNodeView {...props as ChatNodeViewProps<'user' | 'steering'>} />
+      return <SteeringMessageNodeView {...props as ChatNodeViewProps<'steering'>} />
     case 'context':
       return <ContextMessageNodeView {...props as ChatNodeViewProps<'context'>} />
     case 'compaction':

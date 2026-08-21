@@ -9,6 +9,7 @@ import type {
   ModelRetryNode, TurnErrorNode, UserMessageNode,
 } from '@deepseek-ai/dsh-client-runtime/client'
 import { JsonBlock, MessageText, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ChatNodeOwnerProps, ChatNodeViewProps, ChatViewSlotProps } from '../contract/slots.ts'
 import { ReferenceIcon } from '../reference/ReferenceIcon.tsx'
 import { CompactionItem } from './CompactionItem.tsx'
@@ -277,10 +278,37 @@ export function PendingSteeringBubble({ content, renderMessageImages, t }: {
   )
 }
 
-/** User and admitted-steering keyed Chat renderer. */
+/** User message keyed Chat renderer (hosts the user-actions child seat). */
 export const UserMessageNodeView = memo(function UserMessageNodeView({
+  node, renderMessageImages, renderSlot, t,
+}: ChatNodeViewProps<'user'>
+  & PropsRenderSlots<'conversation.chat.user-actions'>) {
+  const data = node.data
+  const userActions = renderSlot('conversation.chat.user-actions', { messageSeq: data.seq })
+  return (
+    <UserStyleBubble
+      content={data.content}
+      renderMessageImages={renderMessageImages}
+      {...data.referenceLabels === undefined ? {} : { referenceLabels: data.referenceLabels }}
+      t={t}
+      actions={text => (
+        <MessageIconActions
+          text={text}
+          time={data.time}
+          clock="start"
+          className={css.actions}
+          t={t}
+          extraActions={userActions}
+        />
+      )}
+    />
+  )
+})
+
+/** Admitted-steering keyed Chat renderer (no action seat; mirrors the pending projection). */
+export const SteeringMessageNodeView = memo(function SteeringMessageNodeView({
   node, renderMessageImages, t,
-}: ChatNodeViewProps<'user' | 'steering'>) {
+}: ChatNodeViewProps<'steering'>) {
   const data = node.data
   return (
     <UserStyleBubble

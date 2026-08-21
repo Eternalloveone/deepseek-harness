@@ -151,6 +151,19 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
       owner: AssistantActionOwnerProps
     }
     /**
+     * Action strip attached to one finalized user message, rendered inside
+     * that message's IconActions row (the mirror of assistant-actions). The
+     * chat entry owns the render site and passes the addressed message's
+     * durable event seq; contributors add per-message actions without
+     * importing the conversation implementation. Entries render by ascending
+     * `order`.
+     */
+    'conversation.chat.user-actions': {
+      kind: 'list'
+      scope: 'session'
+      owner: UserActionOwnerProps
+    }
+    /**
      * The body of the details panel for the tool call the user selected —
      * one occupant, so taking it means rendering every tool's output, not just
      * the ones you know. The owner passes a frozen `block` whose two lifecycle
@@ -398,6 +411,16 @@ export interface TurnTailOwnerProps {
 export interface AssistantActionOwnerProps {
   /** Stable identity carried from the `assistant/message` event. */
   messageId: MessageId
+}
+
+/**
+ * Owner currency of the user-message action strip: the durable event seq of
+ * the one finalized message the contributed actions address. Only finalized
+ * messages reach this slot, so the seq is always present.
+ */
+export interface UserActionOwnerProps {
+  /** Durable event seq carried from the `user/message` event. */
+  messageSeq: number
 }
 
 /** Hook constrained to business data published on the current Chat Node's Turn. */
