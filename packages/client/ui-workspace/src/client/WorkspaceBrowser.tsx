@@ -16,13 +16,13 @@ import {
   IconProjectAddOutline16, IconSearchOutline16, Menu, Modal, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type {
-  SessionId, SessionListState, SessionSearchResultItem, WorkspaceId, WorkspaceView,
+  SessionId, SessionListState, SessionSearchResultItem, SessionSummary, WorkspaceId, WorkspaceView,
 } from '@deepseek-ai/dsh-client-runtime/client'
 import type { WorkspaceBrowserProps } from './contract/slots.ts'
 import type { SessionNode, SessionOrderBy } from './tree.ts'
 import {
   deriveArchived, deriveFlat, deriveGroups, deriveSearchResults, effectiveUpdatedAtById, lastViewedVersionOf,
-  UNGROUPED_KEY, versionAliasedCurrent, versionFamilyMembers,
+  recentVersionForkOf, UNGROUPED_KEY, versionAliasedCurrent, versionFamilyMembers,
 } from './tree.ts'
 import { ProjectRowItem, SearchResultItem, SessionNodeItem } from './rows/Rows.tsx'
 import { FLAT_SESSION_ORDER_KEY } from './stores.ts'
@@ -80,6 +80,16 @@ function openSessionRow(
   const restore = lastViewedVersionOf(id)
   if (restore !== undefined && restore !== id && list.byId[restore] !== undefined) {
     open(restore)
+    return
+  }
+  // dsh-webchatlike fallback: no last-viewed record — the fork was created
+  // and the user switched away while the replayed turn was still running,
+  // before the version pager could record it. Open the family's most
+  // recently active hidden fork so the conversation does not jump back to
+  // version 1 and hide the regenerate/edit result.
+  const recent = recentVersionForkOf(id, list.byId as unknown as Record<string, SessionSummary>)
+  if (recent !== undefined) {
+    open(recent)
     return
   }
   open(id)

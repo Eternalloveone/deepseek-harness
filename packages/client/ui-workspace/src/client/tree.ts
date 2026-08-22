@@ -99,6 +99,106 @@ export function hiddenVersionSessionIds(): ReadonlySet<string> {
 }
 
 /**
+ * Hidden version forks grouped by their ROOT original session — the visible
+ * sidebar row that represents the conversation. Walks each recorded fork's
+ * chain to the root, so forks-of-forks (regenerate/edit inside a version)
+ * fold into the same row. Never throws.
+ * @param hidden - the hidden fork id set (see {@link hiddenVersionSessionIds}).
+ * @returns root original id -> hidden fork ids (discovery order).
+ */
+function hiddenForksByRoot(hidden: ReadonlySet<string>): Map<string, string[]> {
+  const forkOriginal = forkOriginalMap()
+  const byRoot = new Map<string, string[]>()
+  for (const forkId of hidden) {
+    let cursor: string | undefined = forkId
+    const seen = new Set<string>()
+    while (cursor !== undefined && !seen.has(cursor)) {
+      seen.add(cursor)
+      const parent = forkOriginal.get(cursor)
+      if (parent === undefined) break
+      cursor = parent
+    }
+    if (cursor === undefined || cursor === forkId) continue
+    const list = byRoot.get(cursor) ?? []
+    list.push(forkId)
+    byRoot.set(cursor, list)
+  }
+  return byRoot
+}
+
+/**
+ * The most recently active hidden version fork of `id`'s family, or
+ * undefined when the family has no hidden fork newer than the row itself.
+ * Row-open fallback (dsh-webchatlike): without a last-viewed record — e.g.
+ * the fork was created and the user switched away while the replayed turn
+ * was still running, before the version pager could record it — opening the
+ * conversation jumps to the newest fork instead of back to version 1.
+ * Never throws.
+ * @param id - the visible session id (the family's root original).
+ * @param byId - live session summaries by id (hidden forks included).
+ * @returns the newest hidden fork id, or undefined.
+ */
+export function recentVersionForkOf(
+  id: SessionId,
+  byId: Readonly<Record<string, SessionSummary>>,
+): SessionId | undefined {
+  const own = byId[id]
+  if (own === undefined) return undefined
+  const byRoot = hiddenForksByRoot(hiddenVersionSessionIds())
+  let best: SessionId | undefined
+  let bestAt = own.updatedAt
+  for (const forkId of byRoot.get(id) ?? []) {
+    const fork = byId[forkId]
+    if (fork === undefined) continue
+    if (fork.updatedAt > bestAt) {
+      bestAt = fork.updatedAt
+      best = forkId as SessionId
+    }
+  }
+  return best
+}
+
+/**
+ * Live status of a version family folded onto its visible row: the row's own
+ * summary plus every hidden fork rooted at it. Without this pass a
+ * conversation that is running, waiting, or freshly completed through a
+ * hidden regenerate/edit fork would show no status indicator — the fork's own
+ * row is hidden, and the original row only ever reads its own summary.
+ * @param id - the visible session id (the family's root original).
+ * @param byId - live session summaries by id (hidden forks included).
+ * @param byRoot - hidden forks grouped by root original (see {@link hiddenForksByRoot}).
+ * @param descendants - subagent descendant index (running counts per parent).
+ * @returns the family-aggregated status fields.
+ */
+function familyStatusOf(
+  id: SessionId,
+  byId: Readonly<Record<string, SessionSummary>>,
+  byRoot: ReadonlyMap<string, string[]>,
+  descendants: ReadonlyMap<SessionId, SubagentDescendantSummary>,
+): { running: boolean; runningSubagentCount: number; pendingInteraction?: PendingInteractionStatus; completed: boolean } {
+  const own = byId[id]
+  if (own === undefined) return { running: false, runningSubagentCount: 0, completed: false }
+  let running = own.running
+  let completed = own.completed === true
+  let runningSubagentCount = descendants.get(id)?.runningCount ?? 0
+  let pendingInteraction = own.pendingInteraction
+  for (const forkId of byRoot.get(id) ?? []) {
+    const fork = byId[forkId]
+    if (fork === undefined) continue
+    running = running || fork.running
+    completed = completed || fork.completed === true
+    runningSubagentCount += descendants.get(forkId as SessionId)?.runningCount ?? 0
+    if (pendingInteraction === undefined) pendingInteraction = fork.pendingInteraction
+  }
+  return {
+    running,
+    runningSubagentCount,
+    completed,
+    ...(pendingInteraction === undefined ? {} : { pendingInteraction }),
+  }
+}
+
+/**
  * The session the sidebar should treat as current when the open session is a
  * hidden version-family member: the family's ROOT original row represents the
  * conversation, so highlight/group logic maps the member to its root. Returns
@@ -491,16 +591,18 @@ function sessionNode(
   s: SessionSummary,
   descendants: ReadonlyMap<SessionId, SubagentDescendantSummary>,
   byId: Readonly<Record<string, SessionSummary>>,
+  byRoot: ReadonlyMap<string, string[]>,
 ): SessionNode {
+  const status = familyStatusOf(s.id, byId, byRoot, descendants)
   return {
     id: s.id,
     title: aliasedSessionTitle(s, byId),
     blank: s.blank,
-    running: s.running,
-    runningSubagentCount: descendants.get(s.id)?.runningCount ?? 0,
-    completed: s.completed === true,
+    running: status.running,
+    runningSubagentCount: status.runningSubagentCount,
+    completed: status.completed,
     updatedAt: s.updatedAt,
-    ...(s.pendingInteraction === undefined ? {} : { pendingInteraction: s.pendingInteraction }),
+    ...(status.pendingInteraction === undefined ? {} : { pendingInteraction: status.pendingInteraction }),
   }
 }
 
@@ -528,6 +630,7 @@ export function deriveGroups(
 ): GroupNode[] {
   const archived = new Set(archivedSessionIds)
   const hidden = hiddenVersionSessionIds()
+  const byRoot = hiddenForksByRoot(hidden)
   const expandedGroups = new Set(view.expandedGroups)
   const descendants = indexSubagentDescendants(list.byId)
   const effective = effectiveUpdatedAtById(list.byId)
@@ -550,7 +653,7 @@ export function deriveGroups(
       containsCurrent: g.key === currentGroup,
       sessions: expanded
         ? g.sessions.map(session => sessionNode(
-          session, descendants, list.byId as unknown as Record<string, SessionSummary>,
+          session, descendants, list.byId as unknown as Record<string, SessionSummary>, byRoot,
         ))
         : [],
     })
@@ -573,6 +676,7 @@ export function deriveFlat(
 ): SessionNode[] {
   const archived = new Set(archivedSessionIds)
   const hidden = hiddenVersionSessionIds()
+  const byRoot = hiddenForksByRoot(hidden)
   const descendants = indexSubagentDescendants(list.byId)
   const effective = effectiveUpdatedAtById(list.byId)
   const rows: SessionSummary[] = []
@@ -582,7 +686,7 @@ export function deriveFlat(
     rows.push(s)
   }
   rows.sort((a, b) => byRecency(a, b, effective))
-  return rows.map(session => sessionNode(session, descendants, list.byId as unknown as Record<string, SessionSummary>))
+  return rows.map(session => sessionNode(session, descendants, list.byId as unknown as Record<string, SessionSummary>, byRoot))
 }
 
 /** Relative-time bucket of a session row's trailing label. */
@@ -697,22 +801,25 @@ export function deriveArchived(
   archivedSessionIds: readonly SessionId[],
 ): SessionNode[] {
   const hidden = hiddenVersionSessionIds()
+  const byRoot = hiddenForksByRoot(hidden)
   const descendants = indexSubagentDescendants(list.byId)
+  const byId = list.byId as unknown as Record<string, SessionSummary>
   const rows: SessionNode[] = []
   for (const id of archivedSessionIds) {
     const summary = list.byId[id]
     if (summary === undefined || summary.blank || hidden.has(id)) continue
+    const status = familyStatusOf(summary.id, byId, byRoot, descendants)
     rows.push({
       id: summary.id,
-      title: aliasedSessionTitle(summary, list.byId as unknown as Record<string, SessionSummary>),
+      title: aliasedSessionTitle(summary, byId),
       blank: false,
-      running: summary.running,
-      runningSubagentCount: descendants.get(summary.id)?.runningCount ?? 0,
-      completed: summary.completed === true,
+      running: status.running,
+      runningSubagentCount: status.runningSubagentCount,
+      completed: status.completed,
       updatedAt: summary.updatedAt,
-      ...(summary.pendingInteraction === undefined
+      ...(status.pendingInteraction === undefined
         ? {}
-        : { pendingInteraction: summary.pendingInteraction }),
+        : { pendingInteraction: status.pendingInteraction }),
     })
   }
   return rows
