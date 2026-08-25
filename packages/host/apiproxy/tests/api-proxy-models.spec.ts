@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { readFile, rm } from 'node:fs/promises'
+import { access, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -231,6 +231,52 @@ describe('Web session model selection', () => {
       const path = note?.text.match(/已保存到 (.+?)，/)?.[1]
       expect(path).toBeTruthy()
       expect(await readFile(path as string, 'utf8')).toBe(Buffer.from('AQI=', 'base64').toString('utf8'))
+    } finally {
+      if (previousHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousHome
+      await rm(bridgeHome, { recursive: true, force: true })
+    }
+    await ctx.fiber.dispose()
+  })
+
+  it('prunes stale bridge directories while keeping current and recent sessions', async () => {
+    const { ctx, agent, sessionId } = await harness()
+    registerTextOnly(ctx)
+    const followup = vi.fn()
+    Object.assign(agent, { followup })
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'text-only', model: 'plain' }),
+      cwd: '/tmp',
+    })
+    const previousHome = process.env.DSH_HOME
+    const bridgeHome = join(tmpdir(), `dsh-bridge-prune-test-${process.pid}-${Date.now()}`)
+    process.env.DSH_HOME = bridgeHome
+    try {
+      const root = join(bridgeHome, 'see-image-bridge')
+      // A stale directory belonging to another session, untouched for > 30 days.
+      const stale = join(root, 'session-stale')
+      await mkdir(stale, { recursive: true })
+      await writeFile(join(stale, '00-deadbeef.png'), 'stale')
+      const old = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000)
+      await utimes(stale, old, old)
+      // A recent directory belonging to another session survives the TTL.
+      const recent = join(root, 'session-recent')
+      await mkdir(recent, { recursive: true })
+      await writeFile(join(recent, '00-cafebabe.png'), 'fresh')
+
+      const result = await api.sessions.prompt(request({
+        sessionId,
+        mode: 'queue' as const,
+        content: [
+          { type: 'text' as const, text: '看看这张图' },
+          { type: 'image' as const, mediaType: 'image/png' as const, data: 'AQI=' },
+        ],
+      }))
+      expect(result.result.ok).toBe(true)
+      // Stale session reaped, recent and current sessions kept.
+      await expect(access(stale)).rejects.toBeTruthy()
+      await expect(access(recent)).resolves.toBeUndefined()
+      await expect(access(join(root, sessionId))).resolves.toBeUndefined()
     } finally {
       if (previousHome === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previousHome

@@ -4,7 +4,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdir, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { z as zod } from 'zod'
@@ -148,6 +148,49 @@ const BRIDGE_EXT_BY_MEDIA: Record<ImageMediaType, string> = {
 }
 
 /**
+ * Retention for bridged image files. Bridged bytes persist under
+ * `see-image-bridge/<sessionId>/` and are NOT part of the attachment store, so
+ * without a policy they accumulate forever. Each successful bridge write prunes
+ * other sessions' directories that have been untouched for this long; the
+ * current session's directory is always kept (it may still be in active use).
+ */
+const BRIDGE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * Best-effort retention pass over the image-bridge root: remove other
+ * sessions' bridge directories whose last modification predates
+ * {@link BRIDGE_RETENTION_MS}. Never throws — a missing/unreadable root or a
+ * per-directory stat/remove race must not break the bridge write path. The
+ * mtime of a bridge directory is the latest write inside it, so a session that
+ * keeps bridging images stays current and is never reaped.
+ * @param home - the harness home (`resolveDshHome()`), parent of the bridge root.
+ * @param keepSessionId - the session currently bridging; its directory is kept.
+ */
+async function pruneBridgedImages(home: string, keepSessionId: string): Promise<void> {
+  try {
+    const root = join(home, 'see-image-bridge')
+    const entries = await readdir(root, { withFileTypes: true })
+    const cutoff = Date.now() - BRIDGE_RETENTION_MS
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === keepSessionId) continue
+      const dir = join(root, entry.name)
+      try {
+        const meta = await stat(dir)
+        if (meta.mtimeMs < cutoff) {
+          await rm(dir, { recursive: true, force: true })
+        }
+      } catch {
+        // A directory that vanished or cannot be inspected is not worth the
+        // bridge path failing over; skip it and keep pruning the rest.
+      }
+    }
+  } catch {
+    // Missing bridge root (no prior bridging), unreadable root, or unexpected
+    // failure — cleanup is best-effort and never breaks the bridge.
+  }
+}
+
+/**
  * Image bridge for text-only models: persist pasted image bytes as files under
  * the harness home and rewrite the prompt so every image part becomes a text
  * note naming its file, which the model can hand to the `see_image` tool.
@@ -175,6 +218,9 @@ async function bridgeImagesToNotes(
       notes.push(`[用户粘贴了一张图片，已保存到 ${target}，请用 see_image 工具查看]`)
       index += 1
     }
+    // Retention pass runs only on a successful write (natural rate limit: it
+    // fires when bridging actually happens, not on every prompt).
+    await pruneBridgedImages(resolveDshHome(), sessionId)
     let next = 0
     return content.map(part => part.type === 'text'
       ? part
