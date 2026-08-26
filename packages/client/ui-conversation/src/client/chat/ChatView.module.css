@@ -55,6 +55,15 @@
   min-width: 0;
 }
 
+/* Windowed rendering spacers: when ChatView virtualizes (large windows), the
+   rows outside the rendered window are replaced by two inert spacer divs
+   carrying the exact skipped height, so scrollHeight, bottom-follow,
+   at-bottom and paging anchors stay precise while only the visible window
+   mounts real rows. */
+.pad {
+  flex: none;
+}
+
 /* A keyed renderer may intentionally decline its row after dispatch (the
    completed-turn tail does this when it owns neither actions nor extensions).
    An empty flex item must not consume the column gap. */

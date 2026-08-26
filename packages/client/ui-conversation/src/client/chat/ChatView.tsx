@@ -13,7 +13,7 @@
 // ChatNodeSeat subscribes to one Node key, so Assistant deltas and Tool
 // lifecycle updates replace only their own row without remounting it.
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { ConversationTimelineSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
 import { Button, IconChevronDownOutline14, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ChatViewSlotProps, RenderMessageImages } from '../contract/slots.ts'
@@ -49,51 +49,159 @@ function flowTop(row: HTMLElement, scrollport: HTMLElement): number {
   return row.getBoundingClientRect().top - scrollport.getBoundingClientRect().top
 }
 
+/**
+ * Per-row layout metrics for windowed rendering. Measured once after the
+ * window's first full render settles, then maintained incrementally: appended
+ * rows are estimated at the tail, prepends rebuild the whole index. Offsets
+ * are stored in scrollport-content coordinates (independent of the current
+ * scrollTop), so paging resolves rows by binary search over plain numbers
+ * instead of probing DOM geometry on every scroll event.
+ */
+interface RowMetrics {
+  /** node/call key → offset from the scrollport content top, in pixels. */
+  offsets: Map<string, number>
+  /** node/call key → last measured height, in pixels (estimated until measured). */
+  heights: Map<string, number>
+}
+
+/** Height estimate for rows that were never measured (off-window prepends). */
+const ROW_HEIGHT_ESTIMATE = 160
+
+/** Extra rows kept mounted above/below the viewport during windowed rendering. */
+const WINDOW_BUFFER_ROWS = 12
+
 /** Select a visible stable node/call identity, falling back only when layout
- * has not exposed a visible box yet. */
-function pagingAnchor(list: HTMLElement, scrollport: HTMLElement): HTMLElement | null {
+ * has not exposed a visible box yet. When row metrics are available (large
+ * windows in windowed-rendering mode) this binary-searches measured offsets,
+ * which costs no DOM reads; otherwise it scans mounted rows with an early
+ * exit. `elementsFromPoint` is deliberately not used: it performs a full
+ * document hit-test on every call, which blocked the main thread for ~200ms
+ * per scroll event on large windows. */
+function pagingAnchor(
+  list: HTMLElement,
+  scrollport: HTMLElement,
+  metrics: RowMetrics | null,
+): PagingAnchor | HTMLElement | null {
+  if (metrics !== null && metrics.offsets.size > 0) {
+    const keys = [...metrics.offsets.keys()]
+    const target = scrollport.scrollTop
+    // First row whose measured bottom exceeds the viewport top — the topmost
+    // row at/inside the viewport. Pure index math: no DOM geometry reads, so
+    // the hot path never forces layout or materializes skipped rows.
+    let lo = 0
+    let hi = keys.length - 1
+    let idx = keys.length
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      const key = keys[mid] as string
+      const bottom = (metrics.offsets.get(key) as number) + (metrics.heights.get(key) ?? ROW_HEIGHT_ESTIMATE)
+      if (bottom <= target) {
+        lo = mid + 1
+      } else {
+        idx = mid
+        hi = mid - 1
+      }
+    }
+    if (idx >= keys.length) idx = keys.length - 1
+    if (idx < 0) return null
+    const key = keys[idx] as string
+    // Position-only anchor: no DOM probe, so paging never materializes an
+    // off-screen row. Streaming-height drift self-corrects on the next
+    // measured pass (prepend rebuilds; appends extend from the tail).
+    return { key, top: (metrics.offsets.get(key) as number) - scrollport.scrollTop }
+  }
   const viewport = scrollport.getBoundingClientRect()
   const composer = scrollport.querySelector<HTMLElement>('[data-composer-seat]')
   const visibleBottom = composer?.getBoundingClientRect().top ?? viewport.bottom
-  // Scroll events are hot: hit-test a few points through the stretched flow
-  // rows before considering the full mounted set. The fallback keeps jsdom
-  // and pre-layout states deterministic; a virtualizer naturally bounds it.
-  if (typeof document.elementsFromPoint === 'function' && visibleBottom > viewport.top) {
-    const content = list.getBoundingClientRect()
-    const left = Math.max(viewport.left, content.left)
-    const right = Math.min(viewport.right, content.right)
-    const x = left + Math.max(0, right - left) / 2
-    const height = visibleBottom - viewport.top
-    const points = [1, Math.min(32, height / 3), height / 2, Math.max(1, height - 1)]
-    for (const offset of points) {
-      for (const element of document.elementsFromPoint(x, viewport.top + offset)) {
-        const row = element instanceof HTMLElement
-          ? element.closest<HTMLElement>('[data-chat-anchor-key]')
-          : null
-        if (row !== null && list.contains(row)) return row
-      }
-    }
-  }
-  const rows = [...list.querySelectorAll<HTMLElement>('[data-chat-anchor-key]')]
-  const visibleRows = rows.filter((row) => {
+  const rows = list.querySelectorAll<HTMLElement>('[data-chat-anchor-key]')
+  // Rows are mounted in flow order, so the first one crossing the viewport
+  // top is the reader anchor; early-exit keeps this proportional to the rows
+  // above the viewport instead of a full pass.
+  for (const row of rows) {
     const rect = row.getBoundingClientRect()
-    return rect.bottom > viewport.top && rect.top < visibleBottom
-  })
-  return visibleRows[0] ?? rows[0] ?? null
+    if (rect.bottom > viewport.top && rect.top < visibleBottom) return row
+  }
+  return rows[0] ?? null
 }
 
 type ChatScrollPosition = NonNullable<ReturnType<ChatViewSlotProps['chatScroll']['read']>>
 
 /** Capture a reflow-resistant reader position from the current rendered window. */
-function scrollPosition(list: HTMLElement, scrollport: HTMLElement): ChatScrollPosition | null {
-  const row = pagingAnchor(list, scrollport)
-  const anchorKey = row?.dataset.chatAnchorKey
-  if (row === null || anchorKey === undefined) return null
+function scrollPosition(
+  list: HTMLElement,
+  scrollport: HTMLElement,
+  metrics: RowMetrics | null,
+): ChatScrollPosition | null {
+  const anchor = pagingAnchor(list, scrollport, metrics)
+  if (anchor === null) return null
+  if (anchor instanceof HTMLElement) {
+    const anchorKey = anchor.dataset.chatAnchorKey
+    if (anchorKey === undefined) return null
+    return {
+      anchorKey,
+      anchorTop: flowTop(anchor, scrollport),
+      scrollTop: scrollport.scrollTop,
+    }
+  }
   return {
-    anchorKey,
-    anchorTop: flowTop(row, scrollport),
+    anchorKey: anchor.key,
+    anchorTop: anchor.top,
     scrollTop: scrollport.scrollTop,
   }
+}
+
+/** Rebuild the sorted offset index from the current height table. O(n) pure
+ * math — no DOM reads — so it is cheap enough to run after streaming height
+ * changes and appends. */
+function rebuildOffsets(metrics: RowMetrics, keys: readonly string[]): void {
+  let acc = 0
+  for (const key of keys) {
+    metrics.offsets.set(key, acc)
+    acc += metrics.heights.get(key) ?? ROW_HEIGHT_ESTIMATE
+  }
+}
+
+/**
+ * Compute the mounted row slice for a scrollTop plus the exact pixel heights
+ * of the two inert spacers standing in for the skipped rows. Binary search
+ * over the measured offsets keeps this O(log n) with no DOM geometry reads.
+ */
+function computeWindow(
+  scrollTop: number,
+  clientHeight: number,
+  keys: readonly string[],
+  metrics: RowMetrics,
+): { start: number; end: number; topPad: number; bottomPad: number } {
+  const firstPast = (target: number): number => {
+    let lo = 0
+    let hi = keys.length - 1
+    let idx = keys.length
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      const key = keys[mid] as string
+      const bottom = (metrics.offsets.get(key) as number) + (metrics.heights.get(key) ?? ROW_HEIGHT_ESTIMATE)
+      if (bottom <= target) {
+        lo = mid + 1
+      } else {
+        idx = mid
+        hi = mid - 1
+      }
+    }
+    return idx
+  }
+  const start = Math.max(0, firstPast(scrollTop) - WINDOW_BUFFER_ROWS)
+  const end = Math.min(keys.length, firstPast(scrollTop + clientHeight) + WINDOW_BUFFER_ROWS)
+  const topPad = start === 0
+    ? 0
+    : (metrics.offsets.get(keys[start] as string) as number)
+  const lastKey = keys[keys.length - 1]
+  const total = lastKey === undefined
+    ? 0
+    : (metrics.offsets.get(lastKey) as number) + (metrics.heights.get(lastKey) ?? ROW_HEIGHT_ESTIMATE)
+  const bottomPad = end >= keys.length
+    ? 0
+    : total - (metrics.offsets.get(keys[end] as string) as number)
+  return { start, end, topPad, bottomPad }
 }
 
 /** Host/OS refusal text for the file-open dialog; empty throws keep a locale fallback. */
@@ -241,6 +349,13 @@ export function ChatView({
   const lastSteeringId = pendingSteering[pendingSteering.length - 1]?.id ?? null
   const followSig = `${openState}:${firstSeq}:${lastKey}:${order.length}:${running ? 1 : 0}:${lastSteeringId ?? ''}`
 
+  /** Windowed rendering (virtualization): the slice of `order` currently
+   * mounted plus the exact pixel heights of the two inert spacers standing in
+   * for the skipped rows. null = not virtualized (jsdom has no layout, and
+   * short windows gain nothing). */
+  const [windowed, setWindowed] = useState<{ start: number; end: number; topPad: number; bottomPad: number } | null>(null)
+  const metricsRef = useRef<RowMetrics | null>(null)
+
   const toBottom = (el: HTMLElement): void => {
     anchorRef.current = null
     el.scrollTop = el.scrollHeight
@@ -249,6 +364,90 @@ export function ChatView({
     setAtBottom(true)
     chatScroll.save(null)
   }
+
+  /** Compute the mounted window from the reader's intent: while pinned to the
+   * bottom the window always targets the current floor (scrollHeight is the
+   * live DOM floor, independent of the actual scrollTop), so streaming and
+   * history growth cannot leave the mounted slice and the scroll position
+   * disagreeing. */
+  const windowAt = useCallback((
+    metrics: RowMetrics,
+    el: HTMLElement,
+    intentBottom: boolean,
+  ): { start: number; end: number; topPad: number; bottomPad: number } => {
+    const top = intentBottom ? Math.max(0, el.scrollHeight - el.clientHeight) : el.scrollTop
+    return computeWindow(top, el.clientHeight, order, metrics)
+  }, [order])
+
+  /** Re-measure every mounted row into the offset index. Used after a
+   * prepend (loadOlder) and when the window needs a fresh baseline; one full
+   * pass per prepend is fine because it is a low-frequency user action.
+   */
+  const rebuildMetrics = useCallback((local: HTMLElement): void => {
+    const column = local.querySelector<HTMLElement>('[data-chat-flow]')
+    if (column === null) return
+    const port = scrollerOf(local)
+    const portTop = port.getBoundingClientRect().top
+    const scrollTop = port.scrollTop
+    const offsets = new Map<string, number>()
+    const heights = new Map<string, number>()
+    for (const child of column.children) {
+      if (!(child instanceof HTMLElement)) continue
+      const key = child.dataset.chatAnchorKey
+      if (key === undefined) continue
+      const rect = child.getBoundingClientRect()
+      offsets.set(key, rect.top - portTop + scrollTop)
+      heights.set(key, rect.height)
+    }
+    if (offsets.size > 0) metricsRef.current = { offsets, heights }
+  }, [])
+
+  // Windowed-rendering activation: once the window's first full render has
+  // settled, measure every mounted row once and switch to mounting only the
+  // viewport slice plus exact-height spacers. The measurement pass is
+  // layout-cached (the window is already fully laid out). Never enabled in
+  // jsdom (scrollHeight is 0) or for windows that do not scroll, so unit-test
+  // behavior is unchanged.
+  useEffect(() => {
+    if (openState !== 'open' || windowed !== null || metricsRef.current !== null) return
+    const local = listRef.current
+    if (local === null) return
+    const el = scrollerOf(local)
+    if (el.scrollHeight <= el.clientHeight + 1) return // no scrollable extent (also jsdom)
+    let cancelled = false
+    const raf = requestAnimationFrame(() => {
+      if (cancelled) return
+      requestAnimationFrame(() => {
+        if (cancelled) return
+        const node = listRef.current
+        if (node === null) return
+        const column = node.querySelector<HTMLElement>('[data-chat-flow]')
+        if (column === null) return
+        const port = scrollerOf(node)
+        const portTop = port.getBoundingClientRect().top
+        const scrollTop = port.scrollTop
+        const offsets = new Map<string, number>()
+        const heights = new Map<string, number>()
+        for (const child of column.children) {
+          if (!(child instanceof HTMLElement)) continue
+          const key = child.dataset.chatAnchorKey
+          if (key === undefined) continue
+          const rect = child.getBoundingClientRect()
+          offsets.set(key, rect.top - portTop + scrollTop)
+          heights.set(key, rect.height)
+        }
+        if (offsets.size === 0) return
+        metricsRef.current = { offsets, heights }
+        // The open flow may still be pinning to the floor while the window
+        // loads; re-pin against the post-measurement floor so the mounted
+        // slice and scrollTop agree from the first windowed frame.
+        if (atBottomRef.current) toBottom(port)
+        const win = windowAt(metricsRef.current, port, atBottomRef.current)
+        setWindowed(win)
+      })
+    })
+    return () => { cancelled = true; cancelAnimationFrame(raf) }
+  }, [openState, windowed, firstSeq, lastKey, order.length])
 
   useLayoutEffect(() => {
     const local = listRef.current
@@ -271,7 +470,7 @@ export function ChatView({
         const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_THRESHOLD + 1
         atBottomRef.current = isAtBottom
         setAtBottom(isAtBottom)
-        const normalized = isAtBottom ? null : scrollPosition(local, el)
+        const normalized = isAtBottom ? null : scrollPosition(local, el, metricsRef.current)
         if (isAtBottom) chatScroll.save(null)
         else if (normalized !== null) chatScroll.save(normalized)
       }
@@ -290,6 +489,12 @@ export function ChatView({
       const row = anchorElement(local, anchor.key)
       if (row !== null) el.scrollTop += flowTop(row, el) - anchor.top
       observedTopRef.current = el.scrollTop
+      // Prepend inserts off-viewport top rows: rebuild the offset index and
+      // the mounted window so paging and spacers see the new geometry.
+      if (metricsRef.current !== null) {
+        rebuildMetrics(local)
+        setWindowed(windowAt(metricsRef.current, el, false))
+      }
       firstSeqRef.current = firstSeq
       /* v8 ignore next -- ?? arm: a prepend adds nodes, so the flow list here is never empty. */
       lastKeyRef.current = lastKey
@@ -303,12 +508,68 @@ export function ChatView({
     const appendedUser = lastKey !== lastKeyRef.current && lastNode?.kind === 'user'
     const appendedSteering = lastSteeringId !== null && lastSteeringId !== lastSteeringIdRef.current
     const tipMoved = followSigRef.current !== followSig
+    // New trailing rows while windowed: extend the offset index from the
+    // previous measured tail row (heights estimated; the next measurement
+    // pass corrects them once the row renders), so paging and the bottom
+    // spacer stay right without a DOM pass per message.
+    if (metricsRef.current !== null && lastKey !== null && lastKey !== lastKeyRef.current) {
+      const metrics = metricsRef.current
+      let cursorKey: string | null = null
+      for (const key of order) {
+        if (metrics.offsets.has(key)) {
+          cursorKey = key
+          continue
+        }
+        if (cursorKey !== null) {
+          const prevHeight = metrics.heights.get(cursorKey) ?? ROW_HEIGHT_ESTIMATE
+          metrics.offsets.set(key, (metrics.offsets.get(cursorKey) as number) + prevHeight)
+          metrics.heights.set(key, ROW_HEIGHT_ESTIMATE)
+        }
+        cursorKey = key
+      }
+      setWindowed(windowAt(metrics, el, atBottomRef.current))
+    }
+    // While windowed, keep the height table in sync with streaming growth of
+    // mounted rows: measure the rendered slice (cheap — only the window is
+    // mounted) and rebuild offsets when anything moved.
+    if (metricsRef.current !== null) {
+      const metrics = metricsRef.current
+      const column = local.querySelector<HTMLElement>('[data-chat-flow]')
+      if (column !== null) {
+        let changed = false
+        for (const child of column.children) {
+          if (!(child instanceof HTMLElement)) continue
+          const key = child.dataset.chatAnchorKey
+          if (key === undefined) continue
+          const h = child.getBoundingClientRect().height
+          if (Math.abs((metrics.heights.get(key) ?? -1) - h) > 0.5) {
+            metrics.heights.set(key, h)
+            changed = true
+          }
+        }
+        if (changed) {
+          rebuildOffsets(metrics, order)
+          setWindowed(windowAt(metrics, el, atBottomRef.current))
+        }
+      }
+    }
     lastKeyRef.current = lastKey
     lastSteeringIdRef.current = lastSteeringId
     followSigRef.current = followSig
     // Follow new flow content while pinned; do NOT re-pin on every render
     // merely because atBottomRef is true (scroll threshold → setState → snap).
-    if (appendedUser || appendedSteering || (tipMoved && atBottomRef.current)) toBottom(el)
+    if (appendedUser || appendedSteering || (tipMoved && atBottomRef.current)) {
+      toBottom(el)
+      if (metricsRef.current !== null) setWindowed(windowAt(metricsRef.current, el, true))
+    } else if (atBottomRef.current && metricsRef.current !== null) {
+      // Pinned but the floor moved (streaming/history growth that did not
+      // change the tip signature): re-pin and re-window to the new floor.
+      const floor = Math.max(0, el.scrollHeight - el.clientHeight)
+      if (floor - el.scrollTop > FOLLOW_THRESHOLD + 1) {
+        toBottom(el)
+        setWindowed(windowAt(metricsRef.current, el, true))
+      }
+    }
   })
 
   const onScrollRef = useRef(() => {})
@@ -335,7 +596,7 @@ export function ChatView({
     }
     atBottomRef.current = isAtBottom
     setAtBottom(isAtBottom)
-    const position = isAtBottom ? null : scrollPosition(local, el)
+    const position = isAtBottom ? null : scrollPosition(local, el, metricsRef.current)
     if (isAtBottom) {
       anchorRef.current = null
     } else if (anchorRef.current !== null && position !== null) {
@@ -346,6 +607,20 @@ export function ChatView({
     if (isAtBottom) chatScroll.save(null)
     else if (position !== null) chatScroll.save(position)
     observedTopRef.current = el.scrollTop
+    // Windowed rendering: keep the mounted slice in sync with the scroll
+    // position. Binary search + spacer math only; the set bails out when the
+    // slice is unchanged, so steady scrolling costs one cheap computation per
+    // event instead of a DOM pass. While pinned to the bottom the window
+    // targets the live floor rather than the (possibly stale) scrollTop.
+    const metrics = metricsRef.current
+    if (metrics !== null) {
+      const winTop = atBottomRef.current ? Math.max(0, el.scrollHeight - el.clientHeight) : el.scrollTop
+      const next = computeWindow(winTop, el.clientHeight, order, metrics)
+      setWindowed(prev => prev !== null
+        && prev.start === next.start && prev.end === next.end
+        && prev.topPad === next.topPad && prev.bottomPad === next.bottomPad
+        ? prev : next)
+    }
   }
 
   // Bind the scroll listener on the resolved scrollport once per mount;
@@ -401,16 +676,35 @@ export function ChatView({
     /* v8 ignore next -- ref-null guard: the paging button renders inside the list tree. */
     if (local !== null) {
       const el = scrollerOf(local)
-      const row = pagingAnchor(local, el)
-      if (row !== null && row.dataset.chatAnchorKey !== undefined) {
-        anchorRef.current = {
-          key: row.dataset.chatAnchorKey,
-          top: flowTop(row, el),
+      const anchor = pagingAnchor(local, el, metricsRef.current)
+      if (anchor !== null) {
+        if (anchor instanceof HTMLElement) {
+          const key = anchor.dataset.chatAnchorKey
+          if (key !== undefined) anchorRef.current = { key, top: flowTop(anchor, el) }
+        } else {
+          anchorRef.current = { key: anchor.key, top: anchor.top }
         }
       }
     }
     loadOlder()
   }
+
+  const seat = (nodeKey: string): ReactNode => (
+    <ChatNodeSeat
+      key={nodeKey}
+      nodeKey={nodeKey}
+      useSession={useSession}
+      selectedCallId={selectedCallId}
+      cwd={cwd}
+      openFile={requestOpenFile}
+      inspectCall={inspectCall}
+      forkAt={forkAt}
+      renderMessageImages={renderMessageImages}
+      fileMentions={fileMentions}
+      renderSlot={renderSlot}
+      t={t}
+    />
+  )
 
   return (
     <div className={css.root}>
@@ -429,22 +723,15 @@ export function ChatView({
               </button>
             </div>
           )}
-          {order.map(nodeKey => (
-            <ChatNodeSeat
-              key={nodeKey}
-              nodeKey={nodeKey}
-              useSession={useSession}
-              selectedCallId={selectedCallId}
-              cwd={cwd}
-              openFile={requestOpenFile}
-              inspectCall={inspectCall}
-              forkAt={forkAt}
-              renderMessageImages={renderMessageImages}
-              fileMentions={fileMentions}
-              renderSlot={renderSlot}
-              t={t}
-            />
-          ))}
+          {windowed === null ? (
+            order.map(nodeKey => seat(nodeKey))
+          ) : (
+            <>
+              {windowed.topPad > 0 && <div aria-hidden className={css.pad} style={{ height: windowed.topPad }} />}
+              {order.slice(windowed.start, windowed.end).map(nodeKey => seat(nodeKey))}
+              {windowed.bottomPad > 0 && <div aria-hidden className={css.pad} style={{ height: windowed.bottomPad }} />}
+            </>
+          )}
           {/* No pending placeholders: questions (ui-user-questions) and approvals
               (ApprovalPanel) both take over the composer, so a flow card would
               double-render the same wait. */}
