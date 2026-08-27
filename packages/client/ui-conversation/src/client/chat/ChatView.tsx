@@ -70,6 +70,11 @@ const ROW_HEIGHT_ESTIMATE = 160
 /** Extra rows kept mounted above/below the viewport during windowed rendering. */
 const WINDOW_BUFFER_ROWS = 12
 
+/** Windowed rendering needs a real layout engine: jsdom (unit tests)
+ * implements neither observer API, so it stays on the full-row path and the
+ * suite keeps asserting the complete list. */
+const CAN_WINDOW = typeof IntersectionObserver !== 'undefined' && typeof ResizeObserver !== 'undefined'
+
 /** Select a visible stable node/call identity, falling back only when layout
  * has not exposed a visible box yet. When row metrics are available (large
  * windows in windowed-rendering mode) this binary-searches measured offsets,
@@ -355,6 +360,34 @@ export function ChatView({
    * short windows gain nothing). */
   const [windowed, setWindowed] = useState<{ start: number; end: number; topPad: number; bottomPad: number } | null>(null)
   const metricsRef = useRef<RowMetrics | null>(null)
+  /** Whether the window has been measured at least once (real heights). */
+  const measuredRef = useRef(false)
+
+  // Render-phase estimate seeding: from the first frame that has enough rows
+  // (real browsers only), seed an estimate-only offset index and render only
+  // the tail slice, so opening/switching a heavy session never mounts the
+  // whole window just to measure it. The measurement pass replaces the
+  // estimates right after. Writing the ref here is idempotent (same order →
+  // same result), so double-invocation in StrictMode is harmless.
+  if (metricsRef.current === null && CAN_WINDOW && openState === 'open' && order.length > WINDOW_BUFFER_ROWS * 3) {
+    const heights = new Map<string, number>()
+    for (const key of order) heights.set(key, ROW_HEIGHT_ESTIMATE)
+    const metrics: RowMetrics = { offsets: new Map(), heights }
+    rebuildOffsets(metrics, order)
+    metricsRef.current = metrics
+  }
+  /** The window to render: the measured one once available, otherwise the
+   * estimate-mode tail slice (open pins to the bottom). Derived in render so
+   * the first frame with a large order never renders the full list. */
+  const renderWindow = windowed !== null ? windowed : (
+    metricsRef.current !== null && CAN_WINDOW
+      ? (() => {
+        const n = order.length
+        const start = Math.max(0, n - (WINDOW_BUFFER_ROWS * 2 + 24))
+        return { start, end: n, topPad: start * ROW_HEIGHT_ESTIMATE, bottomPad: 0 }
+      })()
+      : null
+  )
 
   const toBottom = (el: HTMLElement): void => {
     anchorRef.current = null
@@ -379,41 +412,38 @@ export function ChatView({
     return computeWindow(top, el.clientHeight, order, metrics)
   }, [order])
 
-  /** Re-measure every mounted row into the offset index. Used after a
-   * prepend (loadOlder) and when the window needs a fresh baseline; one full
-   * pass per prepend is fine because it is a low-frequency user action.
+  /** (Re)build the offset index from the current height table: every row
+   * starts at the estimate, mounted rows (only the window is mounted) get
+   * their measured height, then offsets are rebuilt as an order-prefix sum.
+   * Pure math plus one pass over the ~24 mounted rows — cheap enough to run
+   * after prepends and as the windowed baseline.
    */
   const rebuildMetrics = useCallback((local: HTMLElement): void => {
     const column = local.querySelector<HTMLElement>('[data-chat-flow]')
-    if (column === null) return
-    const port = scrollerOf(local)
-    const portTop = port.getBoundingClientRect().top
-    const scrollTop = port.scrollTop
-    const offsets = new Map<string, number>()
+    if (column === null || order.length === 0) return
     const heights = new Map<string, number>()
+    for (const key of order) heights.set(key, ROW_HEIGHT_ESTIMATE)
     for (const child of column.children) {
       if (!(child instanceof HTMLElement)) continue
       const key = child.dataset.chatAnchorKey
       if (key === undefined) continue
-      const rect = child.getBoundingClientRect()
-      offsets.set(key, rect.top - portTop + scrollTop)
-      heights.set(key, rect.height)
+      heights.set(key, child.getBoundingClientRect().height)
     }
-    if (offsets.size > 0) metricsRef.current = { offsets, heights }
-  }, [])
+    const metrics: RowMetrics = { offsets: new Map(), heights }
+    rebuildOffsets(metrics, order)
+    metricsRef.current = metrics
+  }, [order])
 
-  // Windowed-rendering activation: once the window's first full render has
-  // settled, measure every mounted row once and switch to mounting only the
-  // viewport slice plus exact-height spacers. The measurement pass is
-  // layout-cached (the window is already fully laid out). Never enabled in
-  // jsdom (scrollHeight is 0) or for windows that do not scroll, so unit-test
-  // behavior is unchanged.
+  // Windowed-rendering measurement: after the estimate-mode window settles,
+  // measure its mounted rows into the offset index and re-window against the
+  // measured floor. Never enabled in jsdom (CAN_WINDOW) or short windows, so
+  // unit-test behavior is unchanged.
   useEffect(() => {
-    if (openState !== 'open' || windowed !== null || metricsRef.current !== null) return
+    if (openState !== 'open' || measuredRef.current) return
     const local = listRef.current
     if (local === null) return
     const el = scrollerOf(local)
-    if (el.scrollHeight <= el.clientHeight + 1) return // no scrollable extent (also jsdom)
+    if (el.scrollHeight <= el.clientHeight + 1) return // no scrollable extent
     let cancelled = false
     const raf = requestAnimationFrame(() => {
       if (cancelled) return
@@ -421,33 +451,19 @@ export function ChatView({
         if (cancelled) return
         const node = listRef.current
         if (node === null) return
-        const column = node.querySelector<HTMLElement>('[data-chat-flow]')
-        if (column === null) return
         const port = scrollerOf(node)
-        const portTop = port.getBoundingClientRect().top
-        const scrollTop = port.scrollTop
-        const offsets = new Map<string, number>()
-        const heights = new Map<string, number>()
-        for (const child of column.children) {
-          if (!(child instanceof HTMLElement)) continue
-          const key = child.dataset.chatAnchorKey
-          if (key === undefined) continue
-          const rect = child.getBoundingClientRect()
-          offsets.set(key, rect.top - portTop + scrollTop)
-          heights.set(key, rect.height)
-        }
-        if (offsets.size === 0) return
-        metricsRef.current = { offsets, heights }
+        measuredRef.current = true
+        rebuildMetrics(node)
         // The open flow may still be pinning to the floor while the window
         // loads; re-pin against the post-measurement floor so the mounted
         // slice and scrollTop agree from the first windowed frame.
         if (atBottomRef.current) toBottom(port)
-        const win = windowAt(metricsRef.current, port, atBottomRef.current)
-        setWindowed(win)
+        const metrics = metricsRef.current
+        if (metrics !== null) setWindowed(windowAt(metrics, port, atBottomRef.current))
       })
     })
     return () => { cancelled = true; cancelAnimationFrame(raf) }
-  }, [openState, windowed, firstSeq, lastKey, order.length])
+  }, [openState, firstSeq, lastKey, order.length])
 
   useLayoutEffect(() => {
     const local = listRef.current
@@ -723,13 +739,13 @@ export function ChatView({
               </button>
             </div>
           )}
-          {windowed === null ? (
+          {renderWindow === null ? (
             order.map(nodeKey => seat(nodeKey))
           ) : (
             <>
-              {windowed.topPad > 0 && <div aria-hidden className={css.pad} style={{ height: windowed.topPad }} />}
-              {order.slice(windowed.start, windowed.end).map(nodeKey => seat(nodeKey))}
-              {windowed.bottomPad > 0 && <div aria-hidden className={css.pad} style={{ height: windowed.bottomPad }} />}
+              {renderWindow.topPad > 0 && <div aria-hidden className={css.pad} style={{ height: renderWindow.topPad }} />}
+              {order.slice(renderWindow.start, renderWindow.end).map(nodeKey => seat(nodeKey))}
+              {renderWindow.bottomPad > 0 && <div aria-hidden className={css.pad} style={{ height: renderWindow.bottomPad }} />}
             </>
           )}
           {/* No pending placeholders: questions (ui-user-questions) and approvals
