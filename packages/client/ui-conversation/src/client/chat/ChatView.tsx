@@ -67,6 +67,12 @@ interface RowMetrics {
 /** Height estimate for rows that were never measured (off-window prepends). */
 const ROW_HEIGHT_ESTIMATE = 160
 
+/** Column inter-row gap (`.column` gap: 16px). Measured row heights are
+ * stored including this gap so the offset index matches the real DOM layout;
+ * without it the accumulated 16px/row error shifts the window boundary rows
+ * out of the viewport edge and makes scrolling through long history jitter. */
+const ROW_GAP = 16
+
 /** Extra rows kept mounted above/below the viewport during windowed rendering. */
 const WINDOW_BUFFER_ROWS = 12
 
@@ -388,6 +394,15 @@ export function ChatView({
       })()
       : null
   )
+  /** Mirror of the rendered window for layout effects (measurement needs the
+   * window head to compensate scrollTop when height corrections shift rows). */
+  const renderWindowRef = useRef<typeof renderWindow>(null)
+  renderWindowRef.current = renderWindow
+  /** Per-row last-correction timestamp: rows whose height keeps drifting
+   * (animating/self-sizing charts, expanding disclosures) are re-measured at
+   * most every 500ms so a feedback loop cannot keep re-shifting the viewport
+   * ("always jittering"). First-time estimate→real corrections always run. */
+  const lastCorrectedRef = useRef(new Map<string, number>())
 
   const toBottom = (el: HTMLElement): void => {
     anchorRef.current = null
@@ -427,7 +442,7 @@ export function ChatView({
       if (!(child instanceof HTMLElement)) continue
       const key = child.dataset.chatAnchorKey
       if (key === undefined) continue
-      heights.set(key, child.getBoundingClientRect().height)
+      heights.set(key, child.getBoundingClientRect().height + ROW_GAP)
     }
     const metrics: RowMetrics = { offsets: new Map(), heights }
     rebuildOffsets(metrics, order)
@@ -553,18 +568,44 @@ export function ChatView({
       const column = local.querySelector<HTMLElement>('[data-chat-flow]')
       if (column !== null) {
         let changed = false
+        const now = performance.now()
         for (const child of column.children) {
           if (!(child instanceof HTMLElement)) continue
           const key = child.dataset.chatAnchorKey
           if (key === undefined) continue
-          const h = child.getBoundingClientRect().height
+          if ((lastCorrectedRef.current.get(key) ?? 0) > now - 500) continue
+          const h = child.getBoundingClientRect().height + ROW_GAP
           if (Math.abs((metrics.heights.get(key) ?? -1) - h) > 0.5) {
             metrics.heights.set(key, h)
+            lastCorrectedRef.current.set(key, now)
             changed = true
           }
         }
         if (changed) {
-          rebuildOffsets(metrics, order)
+          // Height corrections shift every row after the window head, which
+          // would make the viewport content jump while scrolling through
+          // rows that are rendered for the first time (think rows collapse to
+          // ~28px but estimate at 160px). Compensate scrollTop by exactly the
+          // window head's offset delta so the reader's content stays put.
+          const win = renderWindowRef.current
+          let delta = 0
+          if (win !== null && win.start < order.length) {
+            const startKey = order[win.start]
+            if (startKey !== undefined) {
+              const before = metrics.offsets.get(startKey) ?? 0
+              rebuildOffsets(metrics, order)
+              const after = metrics.offsets.get(startKey) ?? 0
+              delta = after - before
+            } else {
+              rebuildOffsets(metrics, order)
+            }
+          } else {
+            rebuildOffsets(metrics, order)
+          }
+          if (Math.abs(delta) > 0.5) {
+            el.scrollTop += delta
+            observedTopRef.current = el.scrollTop
+          }
           setWindowed(windowAt(metrics, el, atBottomRef.current))
         }
       }
