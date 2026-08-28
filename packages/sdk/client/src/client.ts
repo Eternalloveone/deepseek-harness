@@ -207,6 +207,9 @@ export class HarnessClient {
       cwd: this.options.cwd,
       env: this.options.env ?? process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
+      // Never surface a console window for the runtime on Windows, even when
+      // this client itself launched without a console.
+      windowsHide: true,
     })
     this.child = child
     child.once('error', (error) => {

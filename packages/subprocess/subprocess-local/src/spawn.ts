@@ -277,8 +277,9 @@ export function taskkillProcessTree(pid: number): void {
   if (pid <= 0) return
   // Outcome deliberately unchecked: an already-absent tree (status 128), exit
   // races, and a missing taskkill binary (spawnSync reports, never throws) are
-  // as tolerable here as ESRCH is for a POSIX group signal.
-  spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' })
+  // as tolerable here as ESRCH is for a POSIX group signal. windowsHide keeps
+  // the taskkill console from flashing a window on a console-less host.
+  spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
 }
 
 /**

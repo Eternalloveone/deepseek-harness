@@ -17,9 +17,12 @@
  *    correct WinConsoleLogonSid does produce a valid S-1-2-1, but the child
  *    then still dies with STATUS_DLL_INIT_FAILED (0xC0000142) whenever
  *    CREATE_NO_WINDOW / CREATE_NEW_CONSOLE is used.
- *  - Console isolation: under this restriction scheme a hidden console is not
- *    attainable, so children share the host console (stdio redirection is
- *    pipe-based and unaffected).
+ *  - Console isolation: CREATE_NO_WINDOW / CREATE_NEW_CONSOLE stay unusable
+ *    under this restriction scheme (see above), so children share the host
+ *    console (stdio redirection is pipe-based and unaffected). The spawn path
+ *    compensates for a console-less host (GUI/service launch) by allocating
+ *    one hidden console up front (ensureHiddenConsole, ffi.ts), so confined
+ *    children inherit an invisible console instead of flashing a window.
  * @module @deepseek-ai/dsh-sandbox-windows-acl/win32-abi
  */
 

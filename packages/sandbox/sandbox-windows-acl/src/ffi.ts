@@ -133,6 +133,13 @@ export interface Win32Bindings {
   // runner can clean up grants after the child exits.
   setConsoleCtrlHandler(handler: null, add: number): number
   getStdHandle(stdHandle: number): NativePtr
+  // A host launched without a console (GUI/service) would otherwise get a
+  // fresh console WINDOW per confined child; the sandbox allocates one hidden
+  // console instead so restricted children inherit it (CREATE_NO_WINDOW is
+  // unusable under the restriction — children die with STATUS_DLL_INIT_FAILED).
+  allocConsole(): number
+  getConsoleWindow(): NativePtr
+  showWindow(hwnd: NativePtr, command: number): number
 }
 
 const PVOID: Ptr = koffi.pointer('void')
@@ -374,6 +381,7 @@ function bindings(): Win32Bindings {
   if (cached !== undefined) return cached
   const kernel32 = koffi.load('kernel32.dll')
   const advapi32 = koffi.load('advapi32.dll')
+  const user32 = koffi.load('user32.dll')
 
   // Each binding shape is verified by verify/abi-probe.cpp against the real
   // Windows headers and exercised end-to-end by tests/probe.spec.ts; the
@@ -427,6 +435,9 @@ function bindings(): Win32Bindings {
     terminateProcess: bind(kernel32, 'TerminateProcess', 'int', [PVOID, 'uint32']),
     setConsoleCtrlHandler: bind(kernel32, 'SetConsoleCtrlHandler', 'int', [PVOID, 'int']),
     getStdHandle: bind(kernel32, 'GetStdHandle', PVOID, ['int']),
+    allocConsole: bind(kernel32, 'AllocConsole', 'int', []),
+    getConsoleWindow: bind(kernel32, 'GetConsoleWindow', PVOID, []),
+    showWindow: bind(user32, 'ShowWindow', 'int', [PVOID, 'int']),
   } as unknown as Win32Bindings
   return cached
 }
@@ -449,6 +460,39 @@ export function win32(): Promise<Win32Bindings> {
  */
 export function win32Sync(): Win32Bindings {
   return bindings()
+}
+
+// SW_HIDE (winuser.h): the console window is created but never shown.
+const SW_HIDE = 0
+let hiddenConsoleAttempted = false
+
+/**
+ * Give this process a hidden console when it has none, so console-subsystem
+ * children inherit a real (invisible) console instead of Windows allocating a
+ * fresh console WINDOW per child. The ACL-restricted spawn path cannot use
+ * CREATE_NO_WINDOW / CREATE_NEW_CONSOLE (children die with
+ * STATUS_DLL_INIT_FAILED, 0xC0000142 — verified empirically, see win32-abi.ts),
+ * so a hidden host console is the only way to keep confined pwsh/bash
+ * invocations from flashing console windows when the host was launched
+ * without one (GUI/service launch). Best-effort and idempotent: a host that
+ * already has a console (terminal launch) is left untouched, AllocConsole
+ * failure is tolerated (the child then gets a visible console, matching the
+ * pre-fix behavior), and a failed hide leaves the console visible rather than
+ * failing the spawn.
+ * @param api - the binding table.
+ */
+export function ensureHiddenConsole(api: Win32Bindings): void {
+  if (hiddenConsoleAttempted) return
+  hiddenConsoleAttempted = true
+  try {
+    const existing = api.getConsoleWindow()
+    if (!isNullPtr(existing)) return
+    if (api.allocConsole() === 0) return
+    const hwnd = api.getConsoleWindow()
+    if (!isNullPtr(hwnd)) api.showWindow(hwnd, SW_HIDE)
+  } catch {
+    // Best-effort: never break the spawn over console cosmetics.
+  }
 }
 
 /**

@@ -5,11 +5,15 @@
  * (CREATE_NO_WINDOW / CREATE_NEW_CONSOLE) is intentionally absent: under this
  * restriction scheme hidden-console children die with STATUS_DLL_INIT_FAILED
  * (0xC0000142) — verified empirically, see win32-abi.ts. Stdio redirection is
- * pipe-based and unaffected; the child shares the host console.
+ * pipe-based and unaffected. Instead of hiding per child, the spawn path
+ * ensures the HOST has a hidden console when it has none (ensureHiddenConsole,
+ * ffi.ts): restricted children then inherit that invisible console, so a
+ * GUI/service-launched host does not flash a fresh console window per pwsh or
+ * bash invocation.
  * @module @deepseek-ai/dsh-sandbox-windows-acl/spawn
  */
 
-import { allocPtrSlot, allocProcessInfo, allocStartupInfo, allocUint32, decodePtr, decodeProcessInfo, decodeUint32, encodeStartupInfo, isNullPtr, throwLastError, throwWin32 } from './ffi.ts'
+import { allocPtrSlot, allocProcessInfo, allocStartupInfo, allocUint32, decodePtr, decodeProcessInfo, decodeUint32, encodeStartupInfo, ensureHiddenConsole, isNullPtr, throwLastError, throwWin32 } from './ffi.ts'
 import type { NativePtr, Win32Bindings } from './ffi.ts'
 import * as abi from './win32-abi.ts'
 
@@ -102,6 +106,10 @@ export function spawnSandboxed(
   token: NativePtr,
   options: { command: string; args: readonly string[]; cwd: string },
 ): SpawnedNative {
+  // The restricted child inherits the host console; give the host a hidden
+  // one when it launched without any so the child does not pop a visible
+  // console window (CREATE_NO_WINDOW is unusable under the restriction).
+  ensureHiddenConsole(api)
   const stdIn = createPipe(api)
   const stdOut = createPipe(api)
   const stdErr = createPipe(api)
@@ -271,6 +279,10 @@ export function spawnSandboxedInherited(
   token: NativePtr,
   options: { command: string; args: readonly string[]; cwd: string },
 ): SpawnedInherited {
+  // Same hidden-console guarantee as spawnSandboxed: the inherited-stdio
+  // child also attaches to the host console, so a console-less host must not
+  // flash a window per confined invocation.
+  ensureHiddenConsole(api)
   const job = createKillOnCloseJob(api)
   const stdIn = api.getStdHandle(abi.STD_INPUT_HANDLE)
   const stdOut = api.getStdHandle(abi.STD_OUTPUT_HANDLE)
