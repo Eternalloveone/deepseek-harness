@@ -1,6 +1,6 @@
 /** Strict per-session header/body content inserted into the resident conversation layout. */
 
-import { useEffect, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useSyncExternalStore } from 'react'
 import clsx from 'clsx'
 import type { SessionId, SessionListState, SessionSummary } from '@deepseek-ai/dsh-client-runtime/client'
 import type {
@@ -197,12 +197,16 @@ export function ConversationSession({
     releaseSessionImages(sessionId)
   }, [releaseSessionImages, sessionId])
 
+  // Identity-stable so the memoized conversation.view (ChatView) is not
+  // re-rendered by unrelated skeleton re-renders (e.g. every keystroke).
+  const onInspectDone = useCallback(() => { actions.setInspect(null) }, [actions])
+
   if (blank && composerPhase === 'blank') return null
   return (
     <div className={css.viewArea}>
       {active !== undefined && renderSlot('conversation.view', {
         inspect,
-        onInspectDone: () => { actions.setInspect(null) },
+        onInspectDone,
       }, { only: active.id })}
     </div>
   )

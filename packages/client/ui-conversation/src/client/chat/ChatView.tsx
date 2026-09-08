@@ -13,7 +13,7 @@
 // ChatNodeSeat subscribes to one Node key, so Assistant deltas and Tool
 // lifecycle updates replace only their own row without remounting it.
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { ConversationTimelineSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
 import { Button, IconChevronDownOutline14, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ChatViewSlotProps, RenderMessageImages } from '../contract/slots.ts'
@@ -272,9 +272,12 @@ function TurnStatus({ startTime, t }: {
 
 /**
  * The chat view slot entry: pure component over the composed props; each
- * ordered business Node crosses the keyed renderer seat.
+ * ordered business Node crosses the keyed renderer seat. Memoized: the slot
+ * framework keeps renderSlot/t/useSession identity-stable per session, so
+ * unrelated re-renders (the composer re-rendering the skeleton on every
+ * keystroke) skip the whole chat tree instead of rebuilding it per frame.
  */
-export function ChatView({
+export const ChatView = memo(function ChatView({
   useSession, useSessions, useStore, renderSlot, sessionId, openFile, loadOlder, loadImage, inspectCall, chatScroll, forkAt,
   fileMentions, t,
 }: ChatViewSlotProps) {
@@ -369,31 +372,16 @@ export function ChatView({
   /** Whether the window has been measured at least once (real heights). */
   const measuredRef = useRef(false)
 
-  // Render-phase estimate seeding: from the first frame that has enough rows
-  // (real browsers only), seed an estimate-only offset index and render only
-  // the tail slice, so opening/switching a heavy session never mounts the
-  // whole window just to measure it. The measurement pass replaces the
-  // estimates right after. Writing the ref here is idempotent (same order →
-  // same result), so double-invocation in StrictMode is harmless.
-  if (metricsRef.current === null && CAN_WINDOW && openState === 'open' && order.length > WINDOW_BUFFER_ROWS * 3) {
-    const heights = new Map<string, number>()
-    for (const key of order) heights.set(key, ROW_HEIGHT_ESTIMATE)
-    const metrics: RowMetrics = { offsets: new Map(), heights }
-    rebuildOffsets(metrics, order)
-    metricsRef.current = metrics
-  }
   /** The window to render: the measured one once available, otherwise the
-   * estimate-mode tail slice (open pins to the bottom). Derived in render so
-   * the first frame with a large order never renders the full list. */
-  const renderWindow = windowed !== null ? windowed : (
-    metricsRef.current !== null && CAN_WINDOW
-      ? (() => {
-        const n = order.length
-        const start = Math.max(0, n - (WINDOW_BUFFER_ROWS * 2 + 24))
-        return { start, end: n, topPad: start * ROW_HEIGHT_ESTIMATE, bottomPad: 0 }
-      })()
-      : null
-  )
+   * estimate-mode tail slice (open pins to the bottom). Memoized on the
+   * order/open state so unrelated re-renders (e.g. the composer re-rendering
+   * on every keystroke) do not re-run the O(n) estimate derivation. */
+  const renderWindow = useMemo(() => {
+    if (windowed !== null) return windowed
+    if (!CAN_WINDOW || openState !== 'open' || order.length <= WINDOW_BUFFER_ROWS * 3) return null
+    const start = Math.max(0, order.length - (WINDOW_BUFFER_ROWS * 2 + 24))
+    return { start, end: order.length, topPad: start * ROW_HEIGHT_ESTIMATE, bottomPad: 0 }
+  }, [windowed, openState, order.length])
   /** Mirror of the rendered window for layout effects (measurement needs the
    * window head to compensate scrollTop when height corrections shift rows). */
   const renderWindowRef = useRef<typeof renderWindow>(null)
@@ -403,6 +391,12 @@ export function ChatView({
    * most every 500ms so a feedback loop cannot keep re-shifting the viewport
    * ("always jittering"). First-time estimate→real corrections always run. */
   const lastCorrectedRef = useRef(new Map<string, number>())
+  /** Window signature of the last measurement pass: the measurement loop only
+   * re-reads row geometry when the mounted window or the order changed (or a
+   * turn is streaming), so unrelated re-renders (e.g. every keystroke of the
+   * composer re-rendering the skeleton) do not pay 24 getBoundingClientRect
+   * calls per frame. */
+  const measuredWindowSigRef = useRef('')
 
   const toBottom = (el: HTMLElement): void => {
     anchorRef.current = null
@@ -567,46 +561,51 @@ export function ChatView({
       const metrics = metricsRef.current
       const column = local.querySelector<HTMLElement>('[data-chat-flow]')
       if (column !== null) {
-        let changed = false
-        const now = performance.now()
-        for (const child of column.children) {
-          if (!(child instanceof HTMLElement)) continue
-          const key = child.dataset.chatAnchorKey
-          if (key === undefined) continue
-          if ((lastCorrectedRef.current.get(key) ?? 0) > now - 500) continue
-          const h = child.getBoundingClientRect().height + ROW_GAP
-          if (Math.abs((metrics.heights.get(key) ?? -1) - h) > 0.5) {
-            metrics.heights.set(key, h)
-            lastCorrectedRef.current.set(key, now)
-            changed = true
+        const win = renderWindowRef.current
+        const sig = `${win?.start ?? -1}:${win?.end ?? -1}:${order.length}`
+        if (sig !== measuredWindowSigRef.current || running) {
+          measuredWindowSigRef.current = sig
+          let changed = false
+          const now = performance.now()
+          for (const child of column.children) {
+            if (!(child instanceof HTMLElement)) continue
+            const key = child.dataset.chatAnchorKey
+            if (key === undefined) continue
+            if ((lastCorrectedRef.current.get(key) ?? 0) > now - 500) continue
+            const h = child.getBoundingClientRect().height + ROW_GAP
+            if (Math.abs((metrics.heights.get(key) ?? -1) - h) > 0.5) {
+              metrics.heights.set(key, h)
+              lastCorrectedRef.current.set(key, now)
+              changed = true
+            }
           }
-        }
-        if (changed) {
+          if (changed) {
           // Height corrections shift every row after the window head, which
           // would make the viewport content jump while scrolling through
           // rows that are rendered for the first time (think rows collapse to
           // ~28px but estimate at 160px). Compensate scrollTop by exactly the
           // window head's offset delta so the reader's content stays put.
-          const win = renderWindowRef.current
-          let delta = 0
-          if (win !== null && win.start < order.length) {
-            const startKey = order[win.start]
-            if (startKey !== undefined) {
-              const before = metrics.offsets.get(startKey) ?? 0
-              rebuildOffsets(metrics, order)
-              const after = metrics.offsets.get(startKey) ?? 0
-              delta = after - before
+            const win = renderWindowRef.current
+            let delta = 0
+            if (win !== null && win.start < order.length) {
+              const startKey = order[win.start]
+              if (startKey !== undefined) {
+                const before = metrics.offsets.get(startKey) ?? 0
+                rebuildOffsets(metrics, order)
+                const after = metrics.offsets.get(startKey) ?? 0
+                delta = after - before
+              } else {
+                rebuildOffsets(metrics, order)
+              }
             } else {
               rebuildOffsets(metrics, order)
             }
-          } else {
-            rebuildOffsets(metrics, order)
+            if (Math.abs(delta) > 0.5) {
+              el.scrollTop += delta
+              observedTopRef.current = el.scrollTop
+            }
+            setWindowed(windowAt(metrics, el, atBottomRef.current))
           }
-          if (Math.abs(delta) > 0.5) {
-            el.scrollTop += delta
-            observedTopRef.current = el.scrollTop
-          }
-          setWindowed(windowAt(metrics, el, atBottomRef.current))
         }
       }
     }
@@ -833,7 +832,7 @@ export function ChatView({
       )}
     </div>
   )
-}
+})
 
 /** In-page Host open-path refusal: the wire reason plus a retry of the same path. */
 function FileOpenErrorDialog({
